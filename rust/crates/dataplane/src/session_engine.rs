@@ -553,6 +553,13 @@ const fn local_admission_client_error(error: RouteError) -> Option<(u16, [u8; 5]
     match error {
         RouteError::NamespaceMissing => Some((1105, *b"HY000", "failed to find a namespace")),
         RouteError::InvalidConfig => Some((1105, *b"HY000", "invalid namespace configuration")),
+        // ER_ACCESS_DENIED_ERROR: the `<keyspace>.<user>` prefix names a
+        // keyspace that no backend of the resolved namespace serves.
+        RouteError::KeyspaceNotServed => Some((
+            1045,
+            *b"28000",
+            "Access denied: the keyspace in the user name is not served by any TiDB instance",
+        )),
         _ => None,
     }
 }
@@ -5900,6 +5907,17 @@ mod tls_wiring_tests {
             None,
             "transient owner drift is retried/fails closed, never mislabeled as namespace missing"
         );
+    }
+
+    #[test]
+    fn unserved_keyspace_prefix_is_access_denied() {
+        let Some((code, state, message)) =
+            local_admission_client_error(RouteError::KeyspaceNotServed)
+        else {
+            unreachable!("an unserved keyspace is a client-visible refusal")
+        };
+        assert_eq!((code, state), (1045, *b"28000"));
+        assert!(message.starts_with("Access denied"));
     }
 
     #[test]

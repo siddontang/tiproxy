@@ -192,7 +192,7 @@ mod tests {
     fn backend_with_version(addr: &str, version: &str) -> BackendInfo {
         BackendInfo {
             addr: addr.to_owned(),
-            keyspace: String::new(),
+            serves: crate::KeyspaceScope::default(),
             ip: addr.split(':').next().unwrap_or_default().to_owned(),
             status_port: 0,
             version: version.to_owned(),

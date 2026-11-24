@@ -724,7 +724,7 @@ mod tests {
             cluster_name: Arc::from(cluster),
             backend: BackendInfo {
                 addr: format!("{ip}:{status_port}"),
-                keyspace: String::new(),
+                serves: crate::KeyspaceScope::default(),
                 ip: ip.to_owned(),
                 status_port,
                 version: String::new(),

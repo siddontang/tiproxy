@@ -52,6 +52,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 mod api_differential;
 mod concurrency;
 mod factors_live;
+mod keyspace;
 mod locality;
 mod migration;
 mod production_dispatch;
@@ -237,6 +238,30 @@ impl KvFixture {
 
     fn backends(&self, backends: &[(&str, &[(&str, &str)])]) {
         self.backends_with_ip(backends, "127.0.0.1");
+    }
+
+    /// Publishes exact `(info key prefix, addr, info JSON)` records, each with
+    /// a `ttl` sibling under the same prefix. The prefix is either
+    /// `/topology/tidb/` or `/keyspaces/tidb/<ks>/topology/tidb/`.
+    fn info_records(&self, records: &[(&str, &str, serde_json::Value)]) {
+        let mut out = Vec::new();
+        for (prefix, addr, info) in records {
+            out.push(KeyValue {
+                key: format!("{prefix}{addr}/info").into_bytes(),
+                mod_revision: 7,
+                value: must(serde_json::to_vec(info)),
+            });
+            out.push(KeyValue {
+                key: format!("{prefix}{addr}/ttl").into_bytes(),
+                mod_revision: 7,
+                value: b"1".to_vec(),
+            });
+        }
+        *self
+            .service
+            .records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = out;
     }
 
     fn backends_with_ip(&self, backends: &[(&str, &[(&str, &str)])], ip: &str) {
@@ -2217,6 +2242,7 @@ async fn review_bscore_first_real_route_scoring_publishes() -> TestResult {
             backend_metrics: Arc::new(crate::BackendMetricHistory::new()),
             input_diagnostics: Arc::new(crate::plane::RouteInputDiagnostics::default()),
             history: Arc::new(crate::MigrationHistory::default()),
+            keyspace_memory: Arc::default(),
         },
     )
     .map_err(|e| format!("{e:?}"))?;
@@ -2224,7 +2250,15 @@ async fn review_bscore_first_real_route_scoring_publishes() -> TestResult {
     let candidate = router.capture().map_err(|e| format!("{e:?}"))?;
     let session = router.open().map_err(|e| format!("{e:?}"))?;
     let reservation = router
-        .reserve_with_ticket(&session, &candidate, ClientInfo::default(), "", &[], 0)
+        .reserve_with_ticket(
+            &session,
+            &candidate,
+            ClientInfo::default(),
+            "",
+            &[],
+            None,
+            0,
+        )
         .map_err(|e| format!("{e:?}"))?;
     let _ = router.finish(&reservation, false);
     let _ = router.close(&session);
@@ -2406,6 +2440,7 @@ async fn review_step5_real_router_revocation_refuses_both_metrics_and_throttle()
                 backend_metrics: Arc::clone(&observations),
                 input_diagnostics: Arc::new(crate::plane::RouteInputDiagnostics::default()),
                 history: Arc::new(crate::MigrationHistory::default()),
+                keyspace_memory: Arc::default(),
             },
         )));
         let score_round = |router: &Router, candidate: &Candidate| -> Result<(), RouteError> {
@@ -2421,6 +2456,7 @@ async fn review_step5_real_router_revocation_refuses_both_metrics_and_throttle()
                     ClientInfo::default(),
                     "",
                     &[],
+                    None,
                     0,
                 );
                 if let Ok(ref reservation) = reserved {
@@ -2495,6 +2531,7 @@ async fn review_step5_real_router_revocation_refuses_both_metrics_and_throttle()
                     ClientInfo::default(),
                     "",
                     &[],
+                    None,
                     0,
                 );
                 if let Ok(ref reservation) = result {

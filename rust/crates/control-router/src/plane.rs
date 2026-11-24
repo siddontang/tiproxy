@@ -369,7 +369,12 @@ impl RoutePlaneHandle {
             }
             Arc::clone(entry)
         };
-        let selector = entry.router.selector()?;
+        // Namespace selection is unchanged; a `<keyspace>.<user>` prefix only
+        // narrows that namespace's backend candidates (see `keyspace.rs`).
+        let keyspace = crate::user_keyspace(user);
+        entry.router.check_keyspace(keyspace)?;
+        let mut selector = entry.router.selector()?;
+        selector.set_keyspace(keyspace);
         let mut updates = self.updates.clone();
         // Only reconciliations after this exact admission can unblock a
         // transient Selector::next boundary.  Do not let an old, unread plane
@@ -517,6 +522,10 @@ pub struct RoutePlane {
     backend_metrics: Arc<crate::BackendMetricHistory>,
     /// The configuration generation whose adoption last cleared `b_score`.
     applied_score_generation: Option<u64>,
+    /// Sticky shared-backend memory per namespace name, for the process
+    /// lifetime: a replaced router incarnation must not forget that its
+    /// namespace has had a multi-keyspace backend.
+    keyspace_memory: BTreeMap<String, Arc<crate::keyspace::KeyspaceMemory>>,
     workers: JoinSet<Result<(), RouteError>>,
 }
 
@@ -578,6 +587,7 @@ impl RoutePlane {
                 score_history: Arc::clone(&score_history),
                 backend_metrics: Arc::clone(&backend_metrics),
                 applied_score_generation: None,
+                keyspace_memory: BTreeMap::new(),
                 ledger_diagnostics: Arc::clone(&ledger_diagnostics),
                 workers: JoinSet::new(),
             },
@@ -656,6 +666,11 @@ impl RoutePlane {
                     backend_metrics: Arc::clone(&self.backend_metrics),
                     input_diagnostics: Arc::clone(&self.input_diagnostics),
                     history: Arc::clone(&self.migration_history),
+                    keyspace_memory: Arc::clone(
+                        self.keyspace_memory
+                            .entry(namespace.namespace.clone())
+                            .or_default(),
+                    ),
                 },
             )?);
             if let Some(sink) = self.migrations.clone() {
@@ -863,6 +878,9 @@ async fn run_route_worker(
             Err(RouteError::StaleCandidate | RouteError::ControlUnavailable) => continue,
             Err(error) => return Err(error),
         };
+        // The worker wakes on every backend publication, so the sticky
+        // shared-backend memory does not depend on client traffic.
+        router.observe_keyspaces(&candidate);
         let now = tokio::time::Instant::now().into_std();
         let result = if tick {
             router.migration_round(
@@ -889,6 +907,7 @@ fn worker_stopped(stop: &watch::Receiver<bool>) -> bool {
 fn refresh_worker_state(router: &Router) -> Result<(), RouteError> {
     match router.capture_retained() {
         Ok(candidate) => {
+            router.observe_keyspaces(&candidate);
             match router.refresh_failover(&candidate, tokio::time::Instant::now().into_std()) {
                 Ok(()) | Err(RouteError::StaleCandidate | RouteError::ControlUnavailable) => Ok(()),
                 Err(error) => Err(error),

@@ -424,7 +424,9 @@ async fn replay() -> TestResult {
                         cluster_name: Arc::from(cluster),
                         backend: BackendInfo {
                             addr: address.into(),
-                            keyspace: text(b, "keyspace").into(),
+                            serves: control_topology::KeyspaceScope::Single(
+                                text(b, "keyspace").into(),
+                            ),
                             ip: b["ip"].as_str().unwrap_or("127.0.0.1").into(),
                             status_port: b["status_port"].as_u64().unwrap_or(0),
                             version: String::new(),

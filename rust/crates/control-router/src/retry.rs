@@ -26,6 +26,8 @@ pub struct Selector {
     router: Arc<Router>,
     session: Session,
     excluded: Vec<String>,
+    /// The keyspace the client selected with its `<keyspace>.<user>` name.
+    keyspace: Option<Arc<str>>,
 }
 
 impl Router {
@@ -38,6 +40,7 @@ impl Router {
             router: Arc::clone(self),
             session: self.open()?,
             excluded: Vec::new(),
+            keyspace: None,
         })
     }
 }
@@ -45,6 +48,17 @@ impl Router {
 impl Selector {
     pub(crate) const fn route_session(&self) -> &Session {
         &self.session
+    }
+
+    /// Binds the client-selected keyspace for every attempt of this cycle.
+    pub(crate) fn set_keyspace(&mut self, keyspace: Option<&str>) {
+        self.keyspace = keyspace.map(Arc::from);
+    }
+
+    /// The client-selected keyspace bound to this selector, if any.
+    #[must_use]
+    pub fn keyspace(&self) -> Option<&str> {
+        self.keyspace.as_deref()
     }
 
     /// Restores a surviving client assignment into this fresh selector.
@@ -80,14 +94,25 @@ impl Selector {
         listener_port: &str,
     ) -> Result<Reservation, RouteError> {
         let excluded: Vec<&str> = self.excluded.iter().map(String::as_str).collect();
-        let mut result =
-            self.router
-                .reserve(&self.session, candidate, client, listener_port, &excluded);
+        let keyspace = self.keyspace.as_deref();
+        let mut result = self.router.reserve_in_keyspace(
+            &self.session,
+            candidate,
+            client,
+            listener_port,
+            &excluded,
+            keyspace,
+        );
         if matches!(result, Err(RouteError::NoBackend)) && !self.excluded.is_empty() {
             self.excluded.clear();
-            result = self
-                .router
-                .reserve(&self.session, candidate, client, listener_port, &[]);
+            result = self.router.reserve_in_keyspace(
+                &self.session,
+                candidate,
+                client,
+                listener_port,
+                &[],
+                keyspace,
+            );
         }
         if let Ok(reservation) = &result {
             let id = &reservation.assignment().backend_id;
