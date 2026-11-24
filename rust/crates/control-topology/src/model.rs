@@ -455,25 +455,45 @@ fn split_topology_key(key: &str) -> Option<(String, &str)> {
 /// Parses a prefix read of `/topology/tidb/` + `/keyspaces/tidb/` into a
 /// liveness-filtered [`TopologySnapshot`].
 ///
-/// An `info` record is retained only when a `ttl` sibling exists for the same
-/// address (Go's liveness gate). Addresses are the sole identity key, matching
-/// Go's `map[string]*TiDBTopologyInfo` — a duplicate address across keyspaces
-/// resolves to the last-parsed record, as in Go.
+/// An `info` record is retained only when a live `ttl` vouches for it (Go's
+/// liveness gate). Addresses are the sole identity key, matching Go's
+/// `map[string]*TiDBTopologyInfo`, so at most one record per address survives.
 ///
-/// Address-collision rule for multi-keyspace nodes: a shared process record
-/// (unprefixed path, `"multi_keyspace": true`) is live only with the `ttl`
-/// of its **own** unprefixed path; a per-keyspace `ttl` for the same address
-/// never keeps a stale shared allow-list alive. A live shared record wins
-/// over every per-keyspace record for the same address regardless of read
-/// order — its allow-list already describes every keyspace the node serves.
-/// Otherwise the historical rule applies unchanged to the single-keyspace
-/// records: the last-parsed one wins, live with any `ttl` for the address.
+/// Liveness pairing and address collisions. Each `info` record is paired with
+/// the `ttl` of its **own** path (`/topology/tidb/<addr>` or
+/// `/keyspaces/tidb/<ks>/topology/tidb/<addr>`); per address:
+///
+/// 1. A shared process record (unprefixed path, `"multi_keyspace": true`)
+///    with its own `ttl` wins over every single-keyspace record regardless of
+///    read order — its allow-list already describes every keyspace the node
+///    serves. A shared record without its own `ttl` is never live, whatever
+///    other `ttl` the address has.
+/// 2. Otherwise, among the single-keyspace records paired with their own
+///    `ttl`, a per-keyspace record wins over the classic one, and among
+///    per-keyspace records the greatest etcd `info` key wins. That is
+///    order-independent and equals Go's last-parsed winner for discovery's
+///    read order (classic prefix, then the keyspace prefix in key order), so
+///    when every record is live the result is Go-identical. A stale record
+///    (an address that moved from keyspace B to A) can therefore never hide
+///    a live registration, which tenant-aware admission relies on.
+/// 3. Only when no record at the address has its own `ttl` does the legacy Go
+///    rule apply: the last-parsed single-keyspace record, live with any `ttl`
+///    for the address. Legacy routing differs from Go only where a record
+///    lacks its own `ttl` while another record at the same address has one.
 #[must_use]
 pub fn parse_tidb_topology(entries: &[(Vec<u8>, Vec<u8>)]) -> TopologySnapshot {
-    let mut infos: BTreeMap<String, BackendInfo> = BTreeMap::new();
+    /// One single-keyspace record: its etcd `info` key, path keyspace and value.
+    struct Single<'a> {
+        key: &'a str,
+        path_keyspace: String,
+        info: BackendInfo,
+    }
+    // Per address, in parse order.
+    let mut singles: BTreeMap<String, Vec<Single<'_>>> = BTreeMap::new();
     let mut shared: BTreeMap<String, BackendInfo> = BTreeMap::new();
+    // `ttl` keys as `(path keyspace, addr)`; empty keyspace is the process path.
+    let mut ttls: BTreeSet<(String, String)> = BTreeSet::new();
     let mut alive: BTreeSet<String> = BTreeSet::new();
-    let mut alive_process: BTreeSet<String> = BTreeSet::new();
     for (raw_key, raw_value) in entries {
         let Ok(key) = std::str::from_utf8(raw_key) else {
             continue;
@@ -489,10 +509,8 @@ pub fn parse_tidb_topology(entries: &[(Vec<u8>, Vec<u8>)]) -> TopologySnapshot {
         }
         match suffix {
             TTL_SUFFIX => {
-                if keyspace.is_empty() {
-                    alive_process.insert(addr.to_owned());
-                }
                 alive.insert(addr.to_owned());
+                ttls.insert((keyspace, addr.to_owned()));
             }
             INFO_SUFFIX => {
                 if let Some(info) = BackendInfo::from_info_json(addr, &keyspace, raw_value) {
@@ -501,23 +519,50 @@ pub fn parse_tidb_topology(entries: &[(Vec<u8>, Vec<u8>)]) -> TopologySnapshot {
                     if info.serves.is_shared() {
                         shared.insert(addr.to_owned(), info);
                     } else {
-                        infos.insert(addr.to_owned(), info);
+                        singles.entry(addr.to_owned()).or_default().push(Single {
+                            key,
+                            path_keyspace: keyspace,
+                            info,
+                        });
                     }
                 }
             }
             _ => {}
         }
     }
-    let shared_live: BTreeMap<String, BackendInfo> = shared
-        .into_iter()
-        .filter(|(addr, _)| alive_process.contains(addr))
-        .collect();
-    let mut backends: Vec<BackendInfo> = infos
-        .into_iter()
-        .filter(|(addr, _)| !shared_live.contains_key(addr) && alive.contains(addr))
-        .map(|(_, info)| info)
-        .collect();
-    backends.extend(shared_live.into_values());
+    let own_ttl = |path_keyspace: &str, addr: &str| {
+        ttls.contains(&(path_keyspace.to_owned(), addr.to_owned()))
+    };
+    let mut backends: Vec<BackendInfo> = Vec::new();
+    let addrs: BTreeSet<String> = singles.keys().chain(shared.keys()).cloned().collect();
+    for addr in addrs {
+        if let Some(info) = shared.remove(&addr).filter(|_| own_ttl("", &addr)) {
+            backends.push(info);
+            continue;
+        }
+        let Some(records) = singles.remove(&addr) else {
+            continue;
+        };
+        // `max_by` keeps the last of equal elements, so a repeated key keeps
+        // its last-parsed value, like Go.
+        let paired = records
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| own_ttl(&record.path_keyspace, &addr))
+            .max_by(|(_, left), (_, right)| {
+                (!left.path_keyspace.is_empty(), left.key)
+                    .cmp(&(!right.path_keyspace.is_empty(), right.key))
+            })
+            .map(|(index, _)| index);
+        let chosen = match paired {
+            Some(index) => Some(index),
+            None if alive.contains(&addr) => records.len().checked_sub(1),
+            None => None,
+        };
+        if let Some(index) = chosen {
+            backends.extend(records.into_iter().nth(index).map(|record| record.info));
+        }
+    }
     backends.sort_by(|left, right| left.addr.cmp(&right.addr));
     TopologySnapshot { backends }
 }
@@ -869,6 +914,99 @@ mod tests {
             kv("/topology/tidb/10.0.0.1:4000/ttl", "1"),
         ]);
         assert_eq!(backend.serves, KeyspaceScope::Any);
+    }
+
+    #[test]
+    fn stale_keyspace_record_never_hides_a_live_one_in_either_order() {
+        // The address moved from keyspace B to A: B's info remains but its
+        // own ttl expired; A is live.
+        let a_info = kv(
+            "/keyspaces/tidb/ksa/topology/tidb/10.0.0.1:4000/info",
+            &info_value("10.0.0.1", 1),
+        );
+        let a_ttl = kv("/keyspaces/tidb/ksa/topology/tidb/10.0.0.1:4000/ttl", "1");
+        let b_info = kv(
+            "/keyspaces/tidb/ksb/topology/tidb/10.0.0.1:4000/info",
+            &info_value("10.0.0.1", 2),
+        );
+        for entries in [
+            [a_info.clone(), a_ttl.clone(), b_info.clone()],
+            [b_info.clone(), a_info.clone(), a_ttl.clone()],
+        ] {
+            let backend = only_backend(&entries);
+            assert_eq!(backend.serves, KeyspaceScope::Single("ksa".to_owned()));
+            assert_eq!(backend.status_port, 1);
+        }
+        // The same holds with a stale classic record against a live keyspace
+        // one, and a stale keyspace record against a live classic one.
+        let classic_info = kv(
+            "/topology/tidb/10.0.0.1:4000/info",
+            &info_value("10.0.0.1", 3),
+        );
+        let classic_ttl = kv("/topology/tidb/10.0.0.1:4000/ttl", "1");
+        for entries in [
+            [classic_info.clone(), b_info.clone(), classic_ttl.clone()],
+            [b_info.clone(), classic_ttl.clone(), classic_info.clone()],
+        ] {
+            assert_eq!(only_backend(&entries).serves, KeyspaceScope::default());
+        }
+        for entries in [
+            [classic_info.clone(), a_info.clone(), a_ttl.clone()],
+            [a_ttl.clone(), a_info.clone(), classic_info.clone()],
+        ] {
+            assert_eq!(
+                only_backend(&entries).serves,
+                KeyspaceScope::Single("ksa".to_owned())
+            );
+        }
+    }
+
+    #[test]
+    fn live_keyspace_records_resolve_deterministically_in_either_order() {
+        // Both live: the greatest etcd info key wins (Go's last-parsed winner
+        // for discovery's key-ordered read), whatever the input order.
+        let a = [
+            kv(
+                "/keyspaces/tidb/ksa/topology/tidb/10.0.0.1:4000/info",
+                &info_value("10.0.0.1", 1),
+            ),
+            kv("/keyspaces/tidb/ksa/topology/tidb/10.0.0.1:4000/ttl", "1"),
+        ];
+        let b = [
+            kv(
+                "/keyspaces/tidb/ksb/topology/tidb/10.0.0.1:4000/info",
+                &info_value("10.0.0.1", 2),
+            ),
+            kv("/keyspaces/tidb/ksb/topology/tidb/10.0.0.1:4000/ttl", "1"),
+        ];
+        let classic = [
+            kv(
+                "/topology/tidb/10.0.0.1:4000/info",
+                &info_value("10.0.0.1", 3),
+            ),
+            kv("/topology/tidb/10.0.0.1:4000/ttl", "1"),
+        ];
+        let forward: Vec<_> = classic.iter().chain(&a).chain(&b).cloned().collect();
+        let backward: Vec<_> = b.iter().chain(&a).chain(&classic).cloned().collect();
+        for entries in [forward, backward] {
+            let backend = only_backend(&entries);
+            assert_eq!(backend.serves, KeyspaceScope::Single("ksb".to_owned()));
+            assert_eq!(backend.status_port, 2);
+        }
+    }
+
+    #[test]
+    fn record_without_own_ttl_falls_back_to_go_rule_only_when_none_is_paired() {
+        // No info at the address has its own ttl: the legacy Go rule keeps
+        // the last-parsed record alive with any ttl at the address.
+        let backend = only_backend(&[
+            kv(
+                "/keyspaces/tidb/ksb/topology/tidb/10.0.0.1:4000/info",
+                &info_value("10.0.0.1", 2),
+            ),
+            kv("/keyspaces/tidb/ksa/topology/tidb/10.0.0.1:4000/ttl", "1"),
+        ]);
+        assert_eq!(backend.serves, KeyspaceScope::Single("ksb".to_owned()));
     }
 
     #[test]
