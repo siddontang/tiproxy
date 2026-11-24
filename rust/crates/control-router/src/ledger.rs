@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use control_routing::RouteAssignment;
+use control_topology::KeyspaceScope;
 
 #[cfg(test)]
 use crate::factors::Factor;
@@ -178,10 +179,9 @@ pub struct Reservation {
     sequence: u64,
     account: Arc<AccountIdentity>,
     assignment: RouteAssignment,
-    /// Whether the selected backend was not migratable (shared, or an
-    /// unverified tenant under keyspace routing) when this attempt was
-    /// reserved; carried to the active session until close.
-    pinned: bool,
+    /// The selected backend's authoritative discovery scope when this attempt
+    /// was reserved; carried to the active session until close.
+    scope: Arc<KeyspaceScope>,
 }
 
 impl Reservation {
@@ -288,9 +288,10 @@ impl ForceClose {
 struct Active {
     account: Arc<AccountIdentity>,
     assignment: RouteAssignment,
-    /// Admitted on a non-migratable backend. Recorded once and never re-read
-    /// from discovery, because the account outlives a changed address record.
-    pinned: bool,
+    /// The backend's discovery scope at admission. Recorded once and never
+    /// re-read from discovery, because the account outlives a changed
+    /// address record.
+    scope: Arc<KeyspaceScope>,
     redirect: Option<Redirect>,
     failed_at: Option<Instant>,
     closing: Option<ForceClose>,
@@ -649,16 +650,21 @@ impl Ledger {
         identity: &Arc<AccountIdentity>,
         assignment: RouteAssignment,
     ) -> Result<Reservation, LedgerError> {
-        self.reserve_scoped(session, identity, assignment, false)
+        self.reserve_scoped(
+            session,
+            identity,
+            assignment,
+            Arc::new(KeyspaceScope::default()),
+        )
     }
 
-    /// [`Self::reserve`] recording whether the backend is migratable.
+    /// [`Self::reserve`] recording the backend's discovery scope.
     pub(crate) fn reserve_scoped(
         &mut self,
         session: &Session,
         identity: &Arc<AccountIdentity>,
         mut assignment: RouteAssignment,
-        pinned: bool,
+        scope: Arc<KeyspaceScope>,
     ) -> Result<Reservation, LedgerError> {
         if let Some(reservation) = self.pending(session)? {
             return Ok(reservation);
@@ -680,7 +686,7 @@ impl Ledger {
             sequence: self.next_reservation,
             account: Arc::clone(identity),
             assignment,
-            pinned,
+            scope,
         };
         // All fallible checks precede the first counter or state change.
         self.next_reservation = next;
@@ -720,7 +726,7 @@ impl Ledger {
             Stage::Active(Box::new(Active {
                 account: Arc::clone(&reservation.account),
                 assignment: reservation.assignment.clone(),
-                pinned: reservation.pinned,
+                scope: Arc::clone(&reservation.scope),
                 redirect: None,
                 closing: None,
                 failed_at: None,
@@ -745,18 +751,13 @@ impl Ledger {
             .collect()
     }
 
-    /// The keyspace retained in this active session's current assignment
-    /// (its admission assignment until a redirect succeeds).
-    pub(crate) fn admitted_keyspace(&self, session: &Session) -> Option<&str> {
+    /// The backend discovery scope recorded when this active session was
+    /// admitted (it is not updated by a later change of the address record).
+    pub(crate) fn admitted_scope(&self, session: &Session) -> Option<&KeyspaceScope> {
         match self.stage(session) {
-            Ok(Stage::Active(active)) => Some(&active.assignment.keyspace),
+            Ok(Stage::Active(active)) => Some(&active.scope),
             _ => None,
         }
-    }
-
-    /// Whether this active session was admitted on a non-migratable backend.
-    pub(crate) fn admitted_pinned(&self, session: &Session) -> bool {
-        matches!(self.stage(session), Ok(Stage::Active(active)) if active.pinned)
     }
 
     pub(crate) fn active_owner(
@@ -994,6 +995,9 @@ impl Ledger {
         if success {
             active.account = Arc::clone(&redirect.target);
             active.assignment = redirect.to.clone();
+            // `scope` stays the admission scope: redirects only run in legacy
+            // namespaces (non-shared both sides). K3 must carry the target's
+            // scope here when it enables tenant-aware redirects.
             active.failed_at = None;
         } else {
             // Go's cooldown starts at issuance, not when the failure arrives.

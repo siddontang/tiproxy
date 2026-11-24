@@ -73,7 +73,7 @@ fn shared_go_composition_observation() {
                         cluster_name: Arc::from("fixture"),
                         backend: BackendInfo {
                             addr: addr.into(),
-                            serves: control_topology::KeyspaceScope::default(),
+                            serves: KeyspaceScope::default(),
                             ip: String::new(),
                             status_port: 0,
                             version: String::new(),

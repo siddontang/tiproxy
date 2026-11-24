@@ -541,15 +541,11 @@ async fn shared_backend_is_never_a_migration_source_or_target() -> TestResult {
         Err(RouteError::CrossKeyspace)
     ));
 
-    // Self-redirect (management reconnect) skips the shared session only.
+    // Self-redirect (management reconnect): none in a tenant-aware namespace.
     let queue = crate::scheduler::CommandQueue::new(8);
     let summary = sim.router().redirect_all_to_self(&queue, Instant::now());
-    assert_eq!(summary.offered, 2);
-    assert_eq!(summary.accepted, 1);
-    let redirect = queue.take_redirect().ok_or("classic self-redirect")?;
-    assert_eq!(redirect.to().backend_id, CLASSIC);
+    assert_eq!((summary.offered, summary.accepted), (2, 0));
     assert!(queue.take_redirect().is_none());
-    assert_eq!(sim.finish(&redirect, true), Settlement::Applied);
 
     // Draining the classic backend proposes a pair onto the shared backend;
     // balance refuses it and moves nothing.
@@ -671,10 +667,10 @@ async fn session_admitted_on_shared_backend_stays_ineligible_after_record_flip()
         Err(RouteError::CrossKeyspace)
     ));
     // Balance / failover-driven: the pair is planned, the offer is refused.
-    let plan = must(sim.prepare_balance(&flipped, ClientInfo::default(), ""))
-        .ok_or("drain pair is planned")?;
-    assert_eq!(plan.redirects().len(), 1);
-    assert!(!must(sim.offer(&plan.redirects()[0])), "offer refused");
+    assert!(matches!(
+        sim.prepare_balance(&flipped, ClientInfo::default(), ""),
+        Err(RouteError::CrossKeyspace)
+    ));
     assert!(sim.take_redirect().is_none());
     // A full scheduler round admits nothing either.
     let (_stop_tx, stop) = watch::channel(false);
@@ -788,15 +784,11 @@ async fn unverified_record_is_never_a_redirect_source_or_target() -> TestResult 
         must(sim.round_at(&drained, true, &stop, now, now, 1));
         assert!(sim.take_redirect().is_none(), "no balance redirect");
     }
-    // Reconnect-to-self: only the verified session may reconnect, and only
-    // to its own verified backend; the unverified one gets no offer.
+    // Reconnect-to-self: no offer for either session.
     let queue = crate::scheduler::CommandQueue::new(8);
     let summary = sim.router().redirect_all_to_self(&queue, Instant::now());
-    assert_eq!((summary.offered, summary.accepted), (2, 1));
-    let redirect = queue.take_redirect().ok_or("verified self-redirect")?;
-    assert_eq!(redirect.to().backend_id, VERIFIED_B);
+    assert_eq!((summary.offered, summary.accepted), (2, 0));
     assert!(queue.take_redirect().is_none());
-    assert_eq!(sim.finish(&redirect, true), Settlement::Applied);
     // Both sessions keep serving where they were.
     assert_eq!(active_count(&sim, VERIFIED_B), 1);
     assert_eq!(active_count(&sim, UNVERIFIED_B), 1);
@@ -848,10 +840,10 @@ async fn session_is_not_redirected_after_its_address_changes_tenant() -> TestRes
         Err(RouteError::CrossKeyspace)
     ));
     // Balance / failover-driven: the ksa pair is planned, the offer refused.
-    let plan = must(sim.prepare_balance(&flipped, ClientInfo::default(), ""))
-        .ok_or("drain pair is planned")?;
-    assert_eq!(plan.redirects().len(), 1);
-    assert!(!must(sim.offer(&plan.redirects()[0])), "offer refused");
+    assert!(matches!(
+        sim.prepare_balance(&flipped, ClientInfo::default(), ""),
+        Err(RouteError::CrossKeyspace)
+    ));
     assert!(sim.take_redirect().is_none());
     let (_stop_tx, stop) = watch::channel(false);
     let now = Instant::now();
@@ -866,6 +858,118 @@ async fn session_is_not_redirected_after_its_address_changes_tenant() -> TestRes
     assert_eq!(active_count(&sim, FLIPPED), 1);
     assert_eq!(active_count(&sim, OTHER_A), 0);
     sim.router().close(&session);
+    Ok(())
+}
+
+/// Two verified ksa backends (4003, 4002) under `/keyspaces/tidb/ksa`.
+fn two_ksa_backends() -> Vec<(String, Vec<u8>)> {
+    vec![
+        keyspace_record("ksa", "127.0.0.1:4003", "info"),
+        keyspace_record("ksa", "127.0.0.1:4003", "ttl"),
+        keyspace_record("ksa", "127.0.0.1:4002", "info"),
+        keyspace_record("ksa", "127.0.0.1:4002", "ttl"),
+    ]
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tenant_aware_namespace_offers_no_redirect_on_any_path() -> TestResult {
+    const HELD: &str = "default/127.0.0.1:4003";
+    const OTHER: &str = "default/127.0.0.1:4002";
+    let (h, first) = harness_with(&[(PROCESS, "127.0.0.1:4002", classic())], 1, true).await?;
+    let sim = simulation(&h);
+    // A session on a verified ksa backend, with another verified ksa backend:
+    // every legacy rule would allow moving it.
+    h.fixture.raw_records(&two_ksa_backends());
+    let c = sim_until(&sim, |c| c.routing.backends.backends.len() == 2).await;
+    let session = active_on(&sim, &c, HELD, &[OTHER]);
+    let queue = crate::scheduler::CommandQueue::new(8);
+
+    // Self-redirect as the first operation after a new publication: the sim
+    // router has not refreshed since (the harness router observes it).
+    let mut records = two_ksa_backends();
+    records.push(keyspace_record("ksa", "127.0.0.1:4005", "info"));
+    records.push(keyspace_record("ksa", "127.0.0.1:4005", "ttl"));
+    h.fixture.raw_records(&records);
+    let published_three = published(&h, &first, 3).await;
+    let summary = sim.router().redirect_all_to_self(&queue, Instant::now());
+    assert_eq!((summary.offered, summary.accepted), (1, 0));
+    assert!(queue.take_redirect().is_none());
+
+    // Direct, balance/failover-driven and a full scheduler round.
+    let c = sim_until(&sim, |c| c.routing.backends.backends.len() == 3).await;
+    assert!(matches!(
+        sim.prepare(&session, &c, OTHER),
+        Err(RouteError::CrossKeyspace)
+    ));
+    h.patch("[proxy]\nfail-backend-list=[\"127.0.0.1:4003\"]", 3);
+    h.source.deliver();
+    h.applied().await;
+    let drained = sim_until(&sim, |candidate| !Arc::ptr_eq(&candidate.config, &c.config)).await;
+    assert!(matches!(
+        sim.prepare_balance(&drained, ClientInfo::default(), ""),
+        Err(RouteError::CrossKeyspace)
+    ));
+    let (_stop_tx, stop) = watch::channel(false);
+    let now = Instant::now();
+    must(sim.round_at(&drained, true, &stop, now, now, 1));
+    assert!(sim.take_redirect().is_none(), "no balance redirect");
+
+    // The held address is withdrawn; the router retains it for the open
+    // session. Self-redirect before and after the router refreshes.
+    h.fixture.raw_records(&records[2..]);
+    published(&h, &published_three, 2).await;
+    let summary = sim.router().redirect_all_to_self(&queue, Instant::now());
+    assert_eq!((summary.offered, summary.accepted), (1, 0));
+    let withdrawn = sim_until(&sim, |c| c.routing.backends.backends.len() == 2).await;
+    let now = Instant::now();
+    must(sim.round_at(&withdrawn, true, &stop, now, now, 1));
+    let summary = sim.router().redirect_all_to_self(&queue, Instant::now());
+    assert_eq!((summary.offered, summary.accepted), (1, 0));
+    assert!(queue.take_redirect().is_none());
+    assert!(sim.take_redirect().is_none());
+
+    // The session keeps serving on its original account.
+    assert_eq!(active_count(&sim, HELD), 1);
+    sim.router().close(&session);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn legacy_namespace_still_redirects() -> TestResult {
+    const HELD: &str = "default/127.0.0.1:4003";
+    const OTHER: &str = "default/127.0.0.1:4002";
+    let (h, _) = harness_with(&[(PROCESS, "127.0.0.1:4002", classic())], 1, false).await?;
+    let sim = simulation(&h);
+    h.fixture.raw_records(&two_ksa_backends());
+    let c = sim_until(&sim, |c| c.routing.backends.backends.len() == 2).await;
+    let first = active_on(&sim, &c, HELD, &[OTHER]);
+    let second = active_on(&sim, &c, HELD, &[OTHER]);
+
+    // Direct redirect is offered and settles.
+    let prepared = must(sim.prepare(&first, &c, OTHER));
+    assert!(must(sim.offer(&prepared)));
+    let redirect = sim.take_redirect().ok_or("direct redirect")?;
+    assert_eq!(redirect.to().backend_id, OTHER);
+    assert_eq!(sim.finish(&redirect, true), Settlement::Applied);
+
+    // Management reconnect-to-self is offered for every session.
+    let queue = crate::scheduler::CommandQueue::new(8);
+    let summary = sim.router().redirect_all_to_self(&queue, Instant::now());
+    assert_eq!((summary.offered, summary.accepted), (2, 2));
+    while let Some(redirect) = queue.take_redirect() {
+        assert_eq!(sim.finish(&redirect, true), Settlement::Applied);
+    }
+
+    // Draining the held backend plans a balance redirect.
+    h.patch("[proxy]\nfail-backend-list=[\"127.0.0.1:4003\"]", 3);
+    h.source.deliver();
+    h.applied().await;
+    let drained = sim_until(&sim, |candidate| !Arc::ptr_eq(&candidate.config, &c.config)).await;
+    let plan = must(sim.prepare_balance(&drained, ClientInfo::default(), ""))
+        .ok_or("legacy drain pair")?;
+    assert_eq!(plan.redirects().len(), 1);
+    sim.router().close(&first);
+    sim.router().close(&second);
     Ok(())
 }
 

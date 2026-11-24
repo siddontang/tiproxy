@@ -19,7 +19,7 @@
 //! the namespace's `keyspace-routing` setting decides whether the keyspace
 //! narrows the backend candidates of the resolved namespace.
 
-use control_topology::MergedBackend;
+use control_topology::{KeyspaceScope, MergedBackend};
 
 use crate::RouteError;
 
@@ -80,18 +80,19 @@ pub(crate) fn admission_filter<'a>(
     }
 }
 
-/// Whether `backend` may be a migration source or target (including a
-/// reconnect to itself). Shared backends never are, until shared-backend
-/// migration is qualified end to end. In a `keyspace-routing` namespace the
-/// tenant must also be verified, so an [`KeyspaceScope::Unverified`] record
-/// (live only through the legacy liveness fallback) is excluded too; legacy
-/// namespaces keep Go's view of such a record.
-///
-/// [`KeyspaceScope::Unverified`]: control_topology::KeyspaceScope::Unverified
-pub(crate) fn migratable(backend: &MergedBackend, keyspace_routing: bool) -> bool {
-    let scope = &backend.backend.serves;
-    let unverified = matches!(scope, control_topology::KeyspaceScope::Unverified(_));
-    !(scope.is_shared() || keyspace_routing && unverified)
+/// PR 1 gate for redirects in `keyspace-routing = true` namespaces: every
+/// redirect (direct, balance/failover-driven, management reconnect-to-self)
+/// is refused there until shared/tenant migration is qualified end to end
+/// (K3). The per-session admission scope and the authoritative-scope checks
+/// below stay in place so K3 only has to open this gate.
+pub(crate) const TENANT_REDIRECTS_ENABLED: bool = false;
+
+/// Whether `backend`'s authoritative discovery scope is the verified single
+/// keyspace `tenant`. Tenant-aware code compares this scope (`serves`), never
+/// the assignment keyspace, which may come from an operator `keyspace` label
+/// on a classic record. Shared and unverified records never qualify.
+pub(crate) fn verified_tenant(backend: &MergedBackend, tenant: &str) -> bool {
+    matches!(&backend.backend.serves, KeyspaceScope::Single(own) if own == tenant)
 }
 
 /// Whether `backend` is a candidate under an (already resolved) filter.
@@ -203,15 +204,27 @@ mod tests {
     }
 
     #[test]
-    fn migratable_requires_a_verified_single_scope_under_keyspace_routing() {
-        use super::migratable;
-        let unverified = backend("a:1", KeyspaceScope::Unverified("ksb".into()));
+    fn verified_tenant_uses_the_discovery_scope_never_a_label() {
+        use super::verified_tenant;
+        let mut labelled = backend("a:1", KeyspaceScope::default());
+        labelled
+            .backend
+            .labels
+            .insert("keyspace".to_owned(), "ksb".to_owned());
+        assert!(
+            !verified_tenant(&labelled, "ksb"),
+            "a label is not a tenant"
+        );
+        assert!(verified_tenant(&labelled, ""));
         let single = backend("b:1", KeyspaceScope::Single("ksb".into()));
-        let shared = backend("c:1", set(&["ksb"]));
-        assert!(!migratable(&unverified, true));
-        assert!(migratable(&unverified, false), "legacy keeps Go's view");
-        assert!(migratable(&single, true) && migratable(&single, false));
-        assert!(!migratable(&shared, true) && !migratable(&shared, false));
+        assert!(verified_tenant(&single, "ksb") && !verified_tenant(&single, "ksa"));
+        for scope in [
+            KeyspaceScope::Unverified("ksb".into()),
+            set(&["ksb"]),
+            KeyspaceScope::Any,
+        ] {
+            assert!(!verified_tenant(&backend("c:1", scope), "ksb"));
+        }
     }
 
     #[test]
