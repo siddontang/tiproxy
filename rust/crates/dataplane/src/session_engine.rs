@@ -3166,6 +3166,14 @@ impl Engine {
                 return Err(WireErrorSource::Proxy);
             };
             identity.apply_change_user(&plan.pending);
+            // The router must not keep vouching for the admission keyspace
+            // once the backend accepted a user with another prefix: report
+            // the committed user, decoded as at admission, so migration
+            // falls back to the rule that never touches shared backends.
+            if let Some(lease) = &self.local_route_lease {
+                // Whether it was cleared only matters to the router's guard.
+                let _cleared = lease.change_user(&String::from_utf8_lossy(plan.pending.username()));
+            }
         }
         if successful {
             // This is the sole prepared-state clear seam: dispatch owns

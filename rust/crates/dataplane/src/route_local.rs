@@ -42,6 +42,7 @@ trait LocalRouteAuthority: Send + Sync {
         listener_port: &str,
     ) -> Result<RouteAssignment, RouteError>;
     fn finish(&mut self, assignment_id: &str, connected: bool) -> Option<Settlement>;
+    fn change_user(&self, user: &str) -> bool;
 }
 
 struct PlaneRouteAuthority {
@@ -82,6 +83,10 @@ impl LocalRouteAuthority for PlaneRouteAuthority {
             return None;
         }
         Some(self.admission.selector().finish(&reservation, connected))
+    }
+
+    fn change_user(&self, user: &str) -> bool {
+        self.admission.selector().change_user(user)
     }
 }
 
@@ -162,6 +167,15 @@ impl LocalRouteChannel {
     #[must_use]
     pub fn namespace(&self) -> &str {
         self.authority.namespace()
+    }
+
+    /// Reports a `COM_CHANGE_USER` the backend accepted, so the router stops
+    /// treating the session as bound to its admission keyspace when the new
+    /// user names another one. Returns whether the session keyspace was
+    /// cleared.
+    #[must_use = "callers may log or count a cleared session keyspace"]
+    pub fn change_user(&self, user: &str) -> bool {
+        self.authority.change_user(user)
     }
 
     fn terminal(&self, error: RouteError) -> RouteAssignment {
@@ -283,6 +297,7 @@ mod tests {
     struct Observed {
         calls: Vec<(String, String, String)>,
         finishes: Vec<(String, bool)>,
+        changed_users: Vec<String>,
         drops: usize,
         active: usize,
     }
@@ -360,6 +375,15 @@ mod tests {
                 observed.active += 1;
             }
             Some(Settlement::Applied)
+        }
+
+        fn change_user(&self, user: &str) -> bool {
+            self.observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .changed_users
+                .push(user.to_owned());
+            true
         }
     }
 
@@ -638,6 +662,19 @@ mod tests {
                 .calls
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn change_user_reaches_the_session_route_authority() {
+        let (channel, observed) = channel([]);
+        assert!(channel.change_user("ks2.app"));
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .changed_users,
+            ["ks2.app".to_owned()]
         );
     }
 

@@ -241,7 +241,7 @@ Namespace values have a separate, equally exact classification:
 | `namespace`, `frontend.user` | Dynamic | CP-CFG persists identity and publishes immutable generations; CP-ROUTE owns listener/user binding and conflicts. |
 | every TLS field below `frontend.security` and `backend.security` | Dynamic, with auto-certs unsupported as above | CP-CFG validates and content-watches material; CP-ROUTE consumes it for new sessions. |
 | every entry in `backend.instances` | Dynamic | CP-CFG persists and orders it; CP-ROUTE owns backend binding. |
-| `keyspace-routing` (Rust-only, default `false`) | Dynamic, new router incarnation | Part of the CP-ROUTE namespace projection, so a change replaces the namespace router; existing sessions keep their router. While `true`, session redirects (direct, balance/failover-driven and management reconnect-to-self) are disabled for the namespace until shared/tenant migration lands. |
+| `keyspace-routing` (Rust-only, default `false`) | Dynamic, new router incarnation | Part of the CP-ROUTE namespace projection, so a change replaces the namespace router; existing sessions keep their router. While `true`, session redirects (direct, balance/failover-driven and management reconnect-to-self) are disabled for the namespace unless `balance.tenant-migration` is on; see below. |
 
 There is deliberately no namespace `keyspace` field. CP-TOPO discovers
 keyspaces and CP-ROUTE #147 binds them to sessions; #146 neither invents nor
@@ -265,8 +265,35 @@ no longer matches the Go namespace checksum.
   liveness fallback (no `info` with its own-path `ttl`) have an unverified
   tenant and serve no prefixed login. No session in such a namespace is
   redirected (direct, balance/failover-driven or management
-  reconnect-to-self) until shared/tenant migration lands; tenant-aware
-  checks compare discovery scopes, never `keyspace` labels.
+  reconnect-to-self) while `balance.tenant-migration` is `false` (default).
+
+With `balance.tenant-migration = true`, every redirect path in a
+`keyspace-routing` namespace checks the tenant against the routing snapshot
+the decision is made against: the source and the target must have records in
+it (a withdrawn address kept for its open sessions has none; the management
+reconnect captures and applies a fresh snapshot first), and the check compares
+discovery scopes (single-keyspace path, allow-list, `"*"`), never `keyspace`
+labels or the assignment keyspace derived from them.
+
+- The session keyspace is the `<keyspace>.` prefix of the handshake user,
+  recorded when the namespace routed the login by it. The backend
+  authenticates exactly that user. A successful `COM_CHANGE_USER` to a user
+  with another prefix, or none, clears it for the rest of the session (fail
+  closed: which tenant a cross-prefix change-user lands in is up to the
+  backend); the same prefix keeps it.
+- A session with a keyspace may be redirected when its recorded scope and
+  its current source serve the keyspace, and only to a target that serves it
+  (single-keyspace equal, allow-list containing it, or `"*"`; never an
+  unverified record). This allows multi-keyspace <-> single-keyspace moves
+  within a tenant and refuses cross-tenant moves. It is the only case where
+  a session admitted on a shared backend may move.
+- Any other session (unprefixed login, rehydrated, or cleared by
+  change-user) may move only within the verified single keyspace it was
+  admitted on, and only while its current source is still that keyspace; a
+  session admitted on a shared or unverified record stays pinned.
+- A successful move records the target's scope as the session's scope.
+- Balancing plans backend pairs without a session keyspace, so it may skip
+  rounds that involve shared backends; each offer re-checks the session.
 
 Example `/config/ns/tenants` value:
 

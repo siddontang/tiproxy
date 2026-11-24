@@ -182,6 +182,8 @@ pub struct Reservation {
     /// The selected backend's authoritative discovery scope when this attempt
     /// was reserved; carried to the active session until close.
     scope: Arc<KeyspaceScope>,
+    /// The session keyspace, see [`Active::keyspace`].
+    keyspace: Option<Arc<str>>,
 }
 
 impl Reservation {
@@ -288,10 +290,19 @@ impl ForceClose {
 struct Active {
     account: Arc<AccountIdentity>,
     assignment: RouteAssignment,
-    /// The backend's discovery scope at admission. Recorded once and never
-    /// re-read from discovery, because the account outlives a changed
-    /// address record.
+    /// The backend's discovery scope at admission, replaced only by the
+    /// target's scope when a redirect succeeds. Never re-read from discovery,
+    /// because the account outlives a changed address record.
     scope: Arc<KeyspaceScope>,
+    /// The session keyspace: the `<keyspace>.` prefix of the handshake user,
+    /// recorded only when a `keyspace-routing` namespace filtered the
+    /// admission to backends serving it. The backend authenticates exactly
+    /// this user name; a session whose backend refuses it closes before any
+    /// redirect. `None` for unprefixed users, legacy namespaces and
+    /// rehydrated sessions. A successful `COM_CHANGE_USER` to a user with
+    /// another prefix clears it for the rest of the session
+    /// ([`Ledger::change_user`]).
+    keyspace: Option<Arc<str>>,
     redirect: Option<Redirect>,
     failed_at: Option<Instant>,
     closing: Option<ForceClose>,
@@ -361,7 +372,8 @@ pub(crate) enum LedgerError {
 #[derive(Clone, Debug)]
 enum Stage {
     Idle,
-    Pending(Reservation),
+    // Boxed like `Active`: the recorded session keyspace made it the large one.
+    Pending(Box<Reservation>),
     Active(Box<Active>),
 }
 
@@ -629,7 +641,7 @@ impl Ledger {
     pub(crate) fn pending(&self, session: &Session) -> Result<Option<Reservation>, LedgerError> {
         match self.stage(session)? {
             Stage::Idle => Ok(None),
-            Stage::Pending(reservation) => Ok(Some(reservation.clone())),
+            Stage::Pending(reservation) => Ok(Some((**reservation).clone())),
             Stage::Active(_) => Err(LedgerError::AlreadyActive),
         }
     }
@@ -655,16 +667,19 @@ impl Ledger {
             identity,
             assignment,
             Arc::new(KeyspaceScope::default()),
+            None,
         )
     }
 
-    /// [`Self::reserve`] recording the backend's discovery scope.
+    /// [`Self::reserve`] recording the backend's discovery scope and the
+    /// session keyspace.
     pub(crate) fn reserve_scoped(
         &mut self,
         session: &Session,
         identity: &Arc<AccountIdentity>,
         mut assignment: RouteAssignment,
         scope: Arc<KeyspaceScope>,
+        keyspace: Option<Arc<str>>,
     ) -> Result<Reservation, LedgerError> {
         if let Some(reservation) = self.pending(session)? {
             return Ok(reservation);
@@ -687,14 +702,17 @@ impl Ledger {
             account: Arc::clone(identity),
             assignment,
             scope,
+            keyspace,
         };
         // All fallible checks precede the first counter or state change.
         self.next_reservation = next;
         if let Some(account) = self.accounts.get_mut(&identity.sequence) {
             account.counts.reserved += 1;
         }
-        self.sessions
-            .insert(session.sequence, Stage::Pending(reservation.clone()));
+        self.sessions.insert(
+            session.sequence,
+            Stage::Pending(Box::new(reservation.clone())),
+        );
         Ok(reservation)
     }
 
@@ -727,6 +745,7 @@ impl Ledger {
                 account: Arc::clone(&reservation.account),
                 assignment: reservation.assignment.clone(),
                 scope: Arc::clone(&reservation.scope),
+                keyspace: reservation.keyspace.clone(),
                 redirect: None,
                 closing: None,
                 failed_at: None,
@@ -760,8 +779,45 @@ impl Ledger {
         }
     }
 
+    /// The active session's keyspace, see [`Active::keyspace`].
+    pub(crate) fn session_keyspace(&self, session: &Session) -> Option<&str> {
+        match self.stage(session) {
+            Ok(Stage::Active(active)) => active.keyspace.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Records a successful `COM_CHANGE_USER` to `user` on an active session.
+    ///
+    /// Fail closed: a user with a different `<keyspace>.` prefix (or none)
+    /// clears the session keyspace for the rest of the session instead of
+    /// adopting the new prefix. The session's backend, and any token it
+    /// issues, was bound to its tenant by the initial authentication; which
+    /// tenant a cross-prefix change-user lands in is up to that backend, so
+    /// the proxy stops vouching for it. Without a keyspace the session falls
+    /// back to the verified-single-tenant rule, which never moves it to or
+    /// from a shared backend. The same prefix keeps the keyspace. Returns
+    /// whether the session keyspace was cleared.
+    pub(crate) fn change_user(&mut self, session: &Session, user: &str) -> bool {
+        if !Arc::ptr_eq(&session.ledger, &self.identity) {
+            return false;
+        }
+        let Some(Stage::Active(active)) = self.sessions.get_mut(&session.sequence) else {
+            return false;
+        };
+        let Some(keyspace) = active.keyspace.as_deref() else {
+            return false;
+        };
+        if crate::user_keyspace(user) == Some(keyspace) {
+            return false;
+        }
+        active.keyspace = None;
+        true
+    }
+
     /// The backend discovery scope recorded when this active session was
-    /// admitted (it is not updated by a later change of the address record).
+    /// admitted, or by its last successful redirect (it is not updated by a
+    /// later change of the address record).
     pub(crate) fn admitted_scope(&self, session: &Session) -> Option<&KeyspaceScope> {
         match self.stage(session) {
             Ok(Stage::Active(active)) => Some(&active.scope),
@@ -779,15 +835,36 @@ impl Ledger {
         }
     }
 
+    /// [`Self::prepare_redirect_scoped`] onto a classic target, checked by
+    /// the assignment-keyspace rule.
+    #[cfg(test)]
+    pub(crate) fn prepare_redirect(
+        &self,
+        session: &Session,
+        target: &Arc<AccountIdentity>,
+        assignment: RouteAssignment,
+        now: Instant,
+        reason: RedirectReason,
+    ) -> Result<Redirect, LedgerError> {
+        self.prepare_redirect_scoped(session, target, assignment, now, reason, false)
+    }
+
     /// Read-only preparation. The enclosing lock must remain held until the
     /// bounded offer and accept/reject finish; no callback may reenter it.
-    pub(crate) fn prepare_redirect(
+    ///
+    /// `tenant_checked`: the router already checked the tenant by discovery
+    /// scope (a `keyspace-routing` namespace with `balance.tenant-migration`).
+    /// The label-derived assignment-keyspace equality is then skipped: it
+    /// cannot express a multi-keyspace target, whose assignment keyspace is
+    /// empty, and a label must never qualify a tenant anyway.
+    pub(crate) fn prepare_redirect_scoped(
         &self,
         session: &Session,
         target: &Arc<AccountIdentity>,
         mut assignment: RouteAssignment,
         now: Instant,
         reason: RedirectReason,
+        tenant_checked: bool,
     ) -> Result<Redirect, LedgerError> {
         let Stage::Active(active) = self.stage(session)? else {
             return Err(LedgerError::NotActive);
@@ -807,7 +884,7 @@ impl Ledger {
         if Arc::ptr_eq(&active.account, target) {
             return Err(LedgerError::SameAccount);
         }
-        if active.assignment.keyspace != assignment.keyspace {
+        if !tenant_checked && active.assignment.keyspace != assignment.keyspace {
             return Err(LedgerError::CrossKeyspace);
         }
         let source = self
@@ -952,11 +1029,28 @@ impl Ledger {
         }
     }
 
+    /// [`Self::finish_redirect_scoped`] without a target scope.
+    #[cfg(test)]
     pub(crate) fn finish_redirect(
         &mut self,
         redirect: &Redirect,
         success: bool,
         now: Instant,
+    ) -> Settlement {
+        self.finish_redirect_scoped(redirect, success, now, None)
+    }
+
+    /// Settles an accepted redirect. On success onto another backend the
+    /// session records `target_scope`, the target's discovery scope as the
+    /// router knows it at settlement, so later tenant checks judge the
+    /// session by the backend it now lives on. A reconnect to the same
+    /// backend keeps the recorded scope.
+    pub(crate) fn finish_redirect_scoped(
+        &mut self,
+        redirect: &Redirect,
+        success: bool,
+        now: Instant,
+        target_scope: Option<Arc<KeyspaceScope>>,
     ) -> Settlement {
         let Ok(Stage::Active(active)) = self.stage(&redirect.session) else {
             return Settlement::Ignored;
@@ -1004,9 +1098,11 @@ impl Ledger {
         if success {
             active.account = Arc::clone(&redirect.target);
             active.assignment = redirect.to.clone();
-            // `scope` stays the admission scope: redirects only run in legacy
-            // namespaces (non-shared both sides). K3 must carry the target's
-            // scope here when it enables tenant-aware redirects.
+            if !Arc::ptr_eq(&redirect.source, &redirect.target)
+                && let Some(scope) = target_scope
+            {
+                active.scope = scope;
+            }
             active.failed_at = None;
         } else {
             // Go's cooldown starts at issuance, not when the failure arrives.

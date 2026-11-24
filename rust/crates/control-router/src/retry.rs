@@ -50,6 +50,14 @@ impl Selector {
         &self.session
     }
 
+    /// Records a successful `COM_CHANGE_USER` to `user` on this session; see
+    /// [`Router::change_user`]. Returns whether the session keyspace was
+    /// cleared.
+    #[must_use = "callers may log or count a cleared session keyspace"]
+    pub fn change_user(&self, user: &str) -> bool {
+        self.router.change_user(&self.session, user)
+    }
+
     /// Binds the client-selected keyspace for every attempt of this cycle.
     pub(crate) fn set_keyspace(&mut self, keyspace: Option<&str>) {
         self.keyspace = keyspace.map(Arc::from);
