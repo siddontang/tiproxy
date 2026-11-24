@@ -36,7 +36,7 @@ fn pick(router: &Router, candidate: &Candidate, stage: &str) -> TestResult<Strin
         .open()
         .map_err(|err| format!("COMPOSE_{stage}_OPEN: {err:?}"))?;
     let result = router
-        .reserve_with_ticket(&session, candidate, ClientInfo::default(), "", &[], 1)
+        .reserve_with_ticket(&session, candidate, ClientInfo::default(), "", &[], None, 1)
         .map_err(|err| format!("COMPOSE_{stage}_RESERVE: {err:?}"))?;
     let id = result.assignment().backend_id.clone();
     assert_eq!(router.close(&session), Settlement::Applied);
@@ -401,7 +401,7 @@ async fn observe_composed() -> TestResult {
     let session = must(router.open());
     let blocked = std::thread::spawn(move || {
         let selected =
-            work.reserve_with_ticket(&session, &frozen, ClientInfo::default(), "", &[], 1);
+            work.reserve_with_ticket(&session, &frozen, ClientInfo::default(), "", &[], None, 1);
         work.close(&session);
         selected
     });

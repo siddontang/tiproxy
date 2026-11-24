@@ -17,6 +17,7 @@
 mod authority;
 mod backend_metric_history;
 mod factors;
+mod keyspace;
 mod ledger;
 mod migration_history;
 mod namespace;
@@ -35,6 +36,7 @@ pub use authority::{Candidate, RouteError, Unsupported};
 pub use factors::{
     BalanceAdvice, BalancePair, Factor, FactorAdvice, FactorReport, FactorScore, RedirectReason,
 };
+pub use keyspace::user_keyspace;
 pub use ledger::{
     Accounting, ForceClose, Redirect, Reservation, RouteLedgerEvidence, Session, Settlement,
 };

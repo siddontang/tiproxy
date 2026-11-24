@@ -52,6 +52,7 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 mod api_differential;
 mod concurrency;
 mod factors_live;
+mod keyspace;
 mod locality;
 mod migration;
 mod production_dispatch;
@@ -239,6 +240,47 @@ impl KvFixture {
         self.backends_with_ip(backends, "127.0.0.1");
     }
 
+    /// Publishes exact `(info key prefix, addr, info JSON)` records, each with
+    /// a `ttl` sibling under the same prefix. The prefix is either
+    /// `/topology/tidb/` or `/keyspaces/tidb/<ks>/topology/tidb/`.
+    /// Publishes exact raw `(key, value)` records, e.g. a `ttl` without its
+    /// `info` sibling.
+    fn raw_records(&self, records: &[(String, Vec<u8>)]) {
+        *self
+            .service
+            .records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = records
+            .iter()
+            .map(|(key, value)| KeyValue {
+                key: key.clone().into_bytes(),
+                mod_revision: 7,
+                value: value.clone(),
+            })
+            .collect();
+    }
+
+    fn info_records(&self, records: &[(&str, &str, serde_json::Value)]) {
+        let mut out = Vec::new();
+        for (prefix, addr, info) in records {
+            out.push(KeyValue {
+                key: format!("{prefix}{addr}/info").into_bytes(),
+                mod_revision: 7,
+                value: must(serde_json::to_vec(info)),
+            });
+            out.push(KeyValue {
+                key: format!("{prefix}{addr}/ttl").into_bytes(),
+                mod_revision: 7,
+                value: b"1".to_vec(),
+            });
+        }
+        *self
+            .service
+            .records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = out;
+    }
+
     fn backends_with_ip(&self, backends: &[(&str, &[(&str, &str)])], ip: &str) {
         let mut records = Vec::new();
         for (addr, labels) in backends {
@@ -385,6 +427,20 @@ impl Harness {
         proxy_zone: &str,
         fixture: KvFixture,
     ) -> TestResult<Self> {
+        Self::with_fixture_routing(rule, policy, backends, health, proxy_zone, fixture, false).await
+    }
+
+    /// [`Self::with_fixture`] with the `default` namespace's
+    /// `keyspace-routing` setting.
+    async fn with_fixture_routing(
+        rule: &str,
+        policy: &str,
+        backends: &[(&str, &[(&str, &str)])],
+        health: HealthCheckConfig,
+        proxy_zone: &str,
+        fixture: KvFixture,
+        keyspace_routing: bool,
+    ) -> TestResult<Self> {
         // Enabled rows use real SQL greeting probes. Empty IP selects the
         // production skip-HTTP path; no health verdict is fabricated here.
         fixture.backends_with_ip(backends, if health.enabled { "" } else { "127.0.0.1" });
@@ -401,6 +457,7 @@ impl Harness {
             (**current.effective()).clone(),
             vec![NamespaceConfig {
                 namespace: "default".into(),
+                keyspace_routing,
                 ..NamespaceConfig::default()
             }],
             SourceRevision {
@@ -2224,7 +2281,15 @@ async fn review_bscore_first_real_route_scoring_publishes() -> TestResult {
     let candidate = router.capture().map_err(|e| format!("{e:?}"))?;
     let session = router.open().map_err(|e| format!("{e:?}"))?;
     let reservation = router
-        .reserve_with_ticket(&session, &candidate, ClientInfo::default(), "", &[], 0)
+        .reserve_with_ticket(
+            &session,
+            &candidate,
+            ClientInfo::default(),
+            "",
+            &[],
+            None,
+            0,
+        )
         .map_err(|e| format!("{e:?}"))?;
     let _ = router.finish(&reservation, false);
     let _ = router.close(&session);
@@ -2421,6 +2486,7 @@ async fn review_step5_real_router_revocation_refuses_both_metrics_and_throttle()
                     ClientInfo::default(),
                     "",
                     &[],
+                    None,
                     0,
                 );
                 if let Ok(ref reservation) = reserved {
@@ -2495,6 +2561,7 @@ async fn review_step5_real_router_revocation_refuses_both_metrics_and_throttle()
                     ClientInfo::default(),
                     "",
                     &[],
+                    None,
                     0,
                 );
                 if let Ok(ref reservation) = result {

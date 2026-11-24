@@ -100,7 +100,12 @@ impl Router {
             let prepared = (|| {
                 if let Some(pair) = report.balance {
                     let source = &state.backends[&pair.from];
-                    let target = state.redirect_target(&source.account, candidate, &pair.to)?;
+                    let target = state.redirect_target(
+                        &source.account,
+                        candidate,
+                        &pair.to,
+                        self.sources.keyspace_routing(),
+                    )?;
                     let redirects = state
                         .ledger
                         .physical_sessions(&source.account)

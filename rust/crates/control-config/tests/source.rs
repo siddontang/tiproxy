@@ -769,6 +769,41 @@ fn legacy_namespace_json_is_name_checked_and_sorted() {
 }
 
 #[test]
+fn namespace_keyspace_routing_defaults_off_and_round_trips() {
+    let legacy = control_config::source::decode_namespace(
+        "a",
+        br#"{"namespace":"a","backend":{"instances":["a:4000"]}}"#,
+    )
+    .unwrap_or_else(|error| unreachable!("legacy namespace: {error}"));
+    assert!(!legacy.keyspace_routing);
+    assert!(!legacy.routing().keyspace_routing);
+    // The default is omitted, so a legacy namespace keeps its Go encoding
+    // (and therefore its Go-identical namespace checksum).
+    let encoded = serde_json::to_string(&legacy)
+        .unwrap_or_else(|error| unreachable!("encode legacy namespace: {error}"));
+    assert!(!encoded.contains("keyspace-routing"), "{encoded}");
+
+    let routed = control_config::source::decode_namespace(
+        "b",
+        br#"{"namespace":"b","keyspace-routing":true}"#,
+    )
+    .unwrap_or_else(|error| unreachable!("keyspace-routing namespace: {error}"));
+    assert!(routed.keyspace_routing);
+    assert!(routed.routing().keyspace_routing);
+    let encoded = serde_json::to_string(&routed)
+        .unwrap_or_else(|error| unreachable!("encode routed namespace: {error}"));
+    assert!(encoded.contains(r#""keyspace-routing":true"#), "{encoded}");
+
+    assert!(matches!(
+        control_config::source::decode_namespace(
+            "c",
+            br#"{"namespace":"c","keyspace-routing":"yes"}"#,
+        ),
+        Err(StoreError::JsonDecode { .. })
+    ));
+}
+
+#[test]
 fn debug_output_redacts_metering_credentials() {
     let store = ConfigNamespaceStore::from_toml(
         br#"

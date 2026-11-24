@@ -240,7 +240,10 @@ fn route_code_to_wire(code: RouteCode) -> ErrorCode {
         RouteCode::GraceExpired => ErrorCode::GraceExpired,
         RouteCode::InvalidSnapshot => ErrorCode::InvalidSnapshot,
         RouteCode::UnsupportedConfiguration => ErrorCode::UnsupportedConfiguration,
-        RouteCode::NoBackend => ErrorCode::NoBackend,
+        // `KeyspaceNotServed` is a process-local refusal with no v1 wire code;
+        // the nearest bridge vocabulary is NO_BACKEND. The local route channel
+        // never encodes it.
+        RouteCode::NoBackend | RouteCode::KeyspaceNotServed => ErrorCode::NoBackend,
         RouteCode::BackendDialFailed => ErrorCode::BackendDialFailed,
         RouteCode::HandshakeRejected => ErrorCode::HandshakeRejected,
         RouteCode::RedirectUnsafe => ErrorCode::RedirectUnsafe,

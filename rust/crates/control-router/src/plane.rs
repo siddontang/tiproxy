@@ -369,7 +369,12 @@ impl RoutePlaneHandle {
             }
             Arc::clone(entry)
         };
-        let selector = entry.router.selector()?;
+        // Namespace selection is unchanged; a `<keyspace>.<user>` prefix only
+        // narrows that namespace's backend candidates (see `keyspace.rs`).
+        let keyspace = crate::user_keyspace(user);
+        entry.router.check_keyspace(keyspace)?;
+        let mut selector = entry.router.selector()?;
+        selector.set_keyspace(keyspace);
         let mut updates = self.updates.clone();
         // Only reconciliations after this exact admission can unblock a
         // transient Selector::next boundary.  Do not let an old, unread plane
@@ -863,6 +868,9 @@ async fn run_route_worker(
             Err(RouteError::StaleCandidate | RouteError::ControlUnavailable) => continue,
             Err(error) => return Err(error),
         };
+        // The worker wakes on every backend publication, so a shared backend
+        // in a legacy namespace is reported without depending on traffic.
+        router.warn_legacy_shared(&candidate);
         let now = tokio::time::Instant::now().into_std();
         let result = if tick {
             router.migration_round(
@@ -889,6 +897,7 @@ fn worker_stopped(stop: &watch::Receiver<bool>) -> bool {
 fn refresh_worker_state(router: &Router) -> Result<(), RouteError> {
     match router.capture_retained() {
         Ok(candidate) => {
+            router.warn_legacy_shared(&candidate);
             match router.refresh_failover(&candidate, tokio::time::Instant::now().into_std()) {
                 Ok(()) | Err(RouteError::StaleCandidate | RouteError::ControlUnavailable) => Ok(()),
                 Err(error) => Err(error),

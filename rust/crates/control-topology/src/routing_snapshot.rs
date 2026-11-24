@@ -459,7 +459,7 @@ mod tests {
                 cluster_name: Arc::from("cluster-a"),
                 backend: BackendInfo {
                     addr: addr.to_owned(),
-                    keyspace: String::new(),
+                    serves: crate::KeyspaceScope::default(),
                     ip: String::new(),
                     status_port: 0,
                     version: String::new(),

@@ -83,7 +83,14 @@ pub enum RouteError {
     /// Redirect source and target are the same retained owner.
     SameBackend,
     /// Migration may never cross keyspace scopes, including empty/nonempty.
+    /// A multi-keyspace (shared) backend is never a migration source or
+    /// target until shared-backend migration is qualified end to end.
     CrossKeyspace,
+    /// The client selected a keyspace with its `<keyspace>.<user>` name, the
+    /// namespace has multi-keyspace backends, and none of its backends serves
+    /// that keyspace. This is terminal; selection never falls back to a
+    /// non-serving backend.
+    KeyspaceNotServed,
 }
 
 impl RouteError {
@@ -126,6 +133,7 @@ impl RouteError {
             Self::ForceClosing => "force_closing",
             Self::SameBackend => "same_backend",
             Self::CrossKeyspace => "cross_keyspace",
+            Self::KeyspaceNotServed => "keyspace_not_served",
         }
     }
 }
@@ -279,6 +287,18 @@ impl Sources {
             self.backend.clone(),
             self.lifecycle.clone(),
         )
+    }
+
+    /// The bound namespace's explicit `keyspace-routing` setting. It is part
+    /// of the namespace routing projection, so flipping it replaces the router
+    /// incarnation instead of changing a live one.
+    pub(crate) const fn keyspace_routing(&self) -> bool {
+        self.namespace.keyspace_routing
+    }
+
+    /// The bound namespace name, for diagnostics.
+    pub(crate) fn namespace_name(&self) -> &str {
+        &self.namespace.name
     }
 
     pub(crate) fn admit(&self) -> Result<Arc<ConfigNamespaceSnapshot>, RouteError> {

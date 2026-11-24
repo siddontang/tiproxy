@@ -81,7 +81,9 @@ pub use metric_collector::{
 pub use metric_source::{
     MetricCapture, MetricConfigError, MetricReadError, MetricRuntimePolicy, MetricSourceHandle,
 };
-pub use model::{BackendInfo, PrometheusInfo, TopologySnapshot, parse_tidb_topology};
+pub use model::{
+    BackendInfo, KeyspaceScope, PrometheusInfo, TopologySnapshot, parse_tidb_topology,
+};
 pub use module::{
     RejectionClass, TopologyClientFactory, TopologyClusterClient, TopologyModule,
     TopologyModuleHandle, TopologyStatus, TopologyUpdateObserver,

@@ -4266,7 +4266,7 @@ ns-servers = ["dns-a:53"]
             cluster_name: Arc::from("cluster-a"),
             backend: BackendInfo {
                 addr: format!("10.0.0.{index}:4000"),
-                keyspace: String::new(),
+                serves: crate::KeyspaceScope::default(),
                 ip: String::new(),
                 status_port: 0,
                 version: String::new(),

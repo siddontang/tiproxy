@@ -352,7 +352,7 @@ fn static_backends(instances: &[String]) -> Vec<MergedBackend> {
             cluster_name: Arc::from(STATIC_CLUSTER_NAME),
             backend: BackendInfo {
                 addr: address.clone(),
-                keyspace: String::new(),
+                serves: crate::KeyspaceScope::default(),
                 ip: String::new(),
                 status_port: 0,
                 version: String::new(),

@@ -192,7 +192,7 @@ mod tests {
     fn backend_with_version(addr: &str, version: &str) -> BackendInfo {
         BackendInfo {
             addr: addr.to_owned(),
-            keyspace: String::new(),
+            serves: crate::KeyspaceScope::default(),
             ip: addr.split(':').next().unwrap_or_default().to_owned(),
             status_port: 0,
             version: version.to_owned(),
@@ -300,6 +300,40 @@ mod tests {
             ],
             "same addr across clusters is kept, sorted by (cluster, addr)"
         );
+    }
+
+    #[tokio::test]
+    async fn shared_keyspace_scopes_remain_independent_across_clusters() {
+        let cluster = |name: &str, tenants: &[&str]| {
+            let mut info = backend("10.0.0.1:4000");
+            info.serves =
+                crate::KeyspaceScope::Set(tenants.iter().copied().map(String::from).collect());
+            FakeCluster::new(
+                name,
+                Outcome::Topology(TopologySnapshot {
+                    backends: vec![info],
+                }),
+            )
+        };
+        let merged = merge_tidb_topology(
+            vec![
+                cluster("west", &["common", "w"]),
+                cluster("east", &["common", "e"]),
+            ],
+            BUDGET,
+        )
+        .await
+        .unwrap_or_else(|_| unreachable!("both cluster fetches succeeded"));
+        let [east, west] = merged.backends.as_slice() else {
+            unreachable!("both backends must survive the merge")
+        };
+        assert_eq!(east.cluster_name.as_ref(), "east");
+        assert_eq!(west.cluster_name.as_ref(), "west");
+        for (backend, own, other) in [(east, "e", "w"), (west, "w", "e")] {
+            assert!(backend.backend.serves.serves("common"));
+            assert!(backend.backend.serves.serves(own));
+            assert!(!backend.backend.serves.serves(other));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

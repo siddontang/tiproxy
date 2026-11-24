@@ -73,7 +73,7 @@ fn shared_go_composition_observation() {
                         cluster_name: Arc::from("fixture"),
                         backend: BackendInfo {
                             addr: addr.into(),
-                            keyspace: String::new(),
+                            serves: KeyspaceScope::default(),
                             ip: String::new(),
                             status_port: 0,
                             version: String::new(),
@@ -102,7 +102,12 @@ fn shared_go_composition_observation() {
             let policy = must(store.current().effective().routing());
             let excluded: Vec<&str> = array(&row["excluded"]).iter().map(string).collect();
             let ids: Vec<&str> = state
-                .routeable(number(&row["group"]), &policy, &excluded)
+                .routeable(
+                    number(&row["group"]),
+                    &policy,
+                    &excluded,
+                    crate::keyspace::KeyspaceFilter::Legacy,
+                )
                 .iter()
                 .map(|(backend, _)| backend.source.backend_id.as_ref())
                 .collect();

@@ -63,6 +63,12 @@ pub enum RouteCode {
     UnsupportedConfiguration,
     /// No routeable backend remains.
     NoBackend,
+    /// The namespace routes by keyspace and no backend serves the keyspace
+    /// the client selected with its `<keyspace>.<user>` name. Terminal, and
+    /// distinct from [`Self::NoBackend`] so the client is refused with an
+    /// access-denied error. Process-local only: the v1 control protocol has
+    /// no such code and carries it as `NO_BACKEND`.
+    KeyspaceNotServed,
     /// A backend dial failed.
     BackendDialFailed,
     /// A backend handshake was rejected.

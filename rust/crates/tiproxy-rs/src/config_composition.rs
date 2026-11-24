@@ -499,7 +499,7 @@ fn wire_backends(topology: &TopologyModuleHandle) -> Vec<BackendSnapshot> {
                 backend_id: merged.backend_id.to_string(),
                 address: merged.backend.addr.clone(),
                 cluster_name: merged.cluster_name.to_string(),
-                keyspace: merged.backend.keyspace.clone(),
+                keyspace: merged.backend.keyspace().to_owned(),
                 healthy: verdict.as_ref().is_some_and(|value| value.healthy),
                 local: verdict.as_ref().is_some_and(|value| value.local),
                 draining: false,

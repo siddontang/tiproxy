@@ -923,7 +923,7 @@ mod tests {
             cluster_name: Arc::from(CLUSTER),
             backend: BackendInfo {
                 addr: addr.clone(),
-                keyspace: String::new(),
+                serves: crate::KeyspaceScope::default(),
                 ip: format!("10.0.0.{index}"),
                 status_port: 4000,
                 version: String::new(),
@@ -943,7 +943,7 @@ mod tests {
             cluster_name: Arc::from(CLUSTER),
             backend: BackendInfo {
                 addr: String::new(),
-                keyspace: String::new(),
+                serves: crate::KeyspaceScope::default(),
                 ip: String::new(),
                 status_port,
                 version: String::new(),
