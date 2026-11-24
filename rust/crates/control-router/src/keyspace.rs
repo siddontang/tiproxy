@@ -128,6 +128,34 @@ pub(crate) fn session_on_tenant(
     }
 }
 
+/// Which tenant rule a redirect target is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TenantRule<'a> {
+    /// One session's redirect, with its session keyspace if it has one; see
+    /// [`tenant_target`].
+    Session(Option<&'a str>),
+    /// Balance/failover pair planning, which is per backend, not per
+    /// session: see [`tenant_pair`]. Every offer of the pair re-checks its
+    /// session with [`TenantRule::Session`].
+    Pair,
+}
+
+/// Whether balance may plan a `source` -> `target` pair at all: both
+/// verified (never `Unverified`) and sharing at least one tenant by
+/// discovery scope. Without this, a pair involving a shared backend could
+/// never be planned and tenant sessions could never be moved between
+/// single-keyspace and shared backends by balance or failover.
+pub(crate) fn tenant_pair(source: &MergedBackend, target: &MergedBackend) -> bool {
+    use KeyspaceScope::{Any, Set, Single, Unverified};
+    match (&source.backend.serves, &target.backend.serves) {
+        (Unverified(_), _) | (_, Unverified(_)) => false,
+        (Single(tenant), other) | (other, Single(tenant)) => other.serves(tenant),
+        (Set(left), Set(right)) => !left.is_disjoint(right),
+        (Any, Set(tenants)) | (Set(tenants), Any) => !tenants.is_empty(),
+        (Any, Any) => true,
+    }
+}
+
 /// The target side of the same rule, on the current records of the source
 /// and the target.
 ///
@@ -278,6 +306,47 @@ mod tests {
             &single_a.backend.serves,
             &unverified
         ));
+    }
+
+    #[test]
+    fn balance_pairs_need_a_shared_verified_tenant() {
+        use super::tenant_pair;
+        let single_a = backend("a:1", KeyspaceScope::Single("ksa".into()));
+        let single_b = backend("b:1", KeyspaceScope::Single("ksb".into()));
+        let shared_ab = backend("c:1", set(&["ksa", "ksb"]));
+        let shared_c = backend("d:1", set(&["ksc"]));
+        let any = backend("e:1", KeyspaceScope::Any);
+        let unverified = backend("f:1", KeyspaceScope::Unverified("ksa".into()));
+        let empty = backend("g:1", KeyspaceScope::Set(BTreeSet::new()));
+        for (from, to) in [
+            (&single_a, &single_a),
+            (&single_a, &shared_ab),
+            (&shared_ab, &single_b),
+            (&shared_ab, &any),
+            (&any, &single_a),
+            (&any, &any),
+        ] {
+            assert!(
+                tenant_pair(from, to),
+                "{:?} -> {:?}",
+                from.backend.serves,
+                to.backend.serves
+            );
+        }
+        for (from, to) in [
+            (&single_a, &single_b),
+            (&shared_ab, &shared_c),
+            (&single_a, &unverified),
+            (&unverified, &single_a),
+            (&any, &empty),
+        ] {
+            assert!(
+                !tenant_pair(from, to),
+                "{:?} -> {:?}",
+                from.backend.serves,
+                to.backend.serves
+            );
+        }
     }
 
     #[test]

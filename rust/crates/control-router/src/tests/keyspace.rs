@@ -1215,11 +1215,16 @@ fn active(sim: &MigrationSimulation, id: &str) -> u64 {
         .map_or(0, crate::Accounting::active)
 }
 
-/// Offers `prepared`, settles it successfully and checks it moved.
+/// Offers `prepared`, revalidates it for execution as the session engine
+/// does, settles it successfully and checks it moved.
 fn migrate(sim: &MigrationSimulation, prepared: &crate::PreparedRedirect, to: &str) {
     assert!(must(sim.offer(prepared)), "offer to {to} accepted");
     let redirect = must(sim.take_redirect().ok_or("admitted redirect"));
     assert_eq!(redirect.to().backend_id, to);
+    assert!(
+        sim.router().revalidate_redirect(&prepared.session, to),
+        "execution revalidated"
+    );
     assert_eq!(sim.finish(&redirect, true), Settlement::Applied);
 }
 
@@ -1627,5 +1632,178 @@ async fn k3_keyspace_label_never_qualifies_a_target() -> TestResult {
     }
     sim.router().close(&keyed);
     sim.router().close(&unkeyed);
+    Ok(())
+}
+
+/// Offers `prepared` and returns the accepted, not yet executed redirect.
+fn accept(sim: &MigrationSimulation, prepared: &crate::PreparedRedirect) -> crate::Redirect {
+    assert!(must(sim.offer(prepared)), "offer accepted");
+    must(sim.take_redirect().ok_or("admitted redirect"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k3_execution_revalidates_an_accepted_redirect() -> TestResult {
+    let (h, _) = harness_with(&k3_records(), K3_BACKENDS, true).await?;
+    let sim = simulation(&h);
+    sim_ready(&sim, K3_BACKENDS).await;
+    let on = tenant_migration(&h, &sim, true, 3).await;
+
+    // Change-user to another tenant after acceptance.
+    let changed = active_in(&sim, &on, SHARED_AB, Some("ksa"));
+    let queued = accept(&sim, &must(sim.prepare(&changed, &on, SINGLE_A)));
+    assert!(sim.router().change_user(&changed, "ksb.app"));
+    assert!(!sim.router().revalidate_redirect(&changed, SINGLE_A));
+    assert_eq!(sim.finish(&queued, false), Settlement::Applied);
+    assert_eq!((active(&sim, SHARED_AB), active(&sim, SINGLE_A)), (1, 0));
+
+    // Target withdrawn while queued.
+    let withdrawn = active_in(&sim, &on, SINGLE_A, Some("ksa"));
+    let queued = accept(&sim, &must(sim.prepare(&withdrawn, &on, SINGLE_A2)));
+    let current = republish(
+        &h,
+        &sim,
+        &on,
+        &k3_records_without("127.0.0.1:4006"),
+        K3_BACKENDS - 1,
+    )
+    .await;
+    assert!(!sim.router().revalidate_redirect(&withdrawn, SINGLE_A2));
+    assert_eq!(sim.finish(&queued, false), Settlement::Applied);
+
+    // Gate disabled while queued.
+    let gated = active_in(&sim, &current, SINGLE_A, Some("ksa"));
+    let queued = accept(&sim, &must(sim.prepare(&gated, &current, SHARED_AC)));
+    tenant_migration_with(&h, &sim, false, 4, K3_BACKENDS - 1).await;
+    assert!(!sim.router().revalidate_redirect(&gated, SHARED_AC));
+    assert_eq!(sim.finish(&queued, false), Settlement::Applied);
+    assert_eq!(active(&sim, SHARED_AC), 0);
+    for session in [changed, withdrawn, gated] {
+        sim.router().close(&session);
+    }
+    Ok(())
+}
+
+/// [`tenant_migration`] for a topology of `expected` backends.
+async fn tenant_migration_with(
+    h: &Harness,
+    sim: &MigrationSimulation,
+    enabled: bool,
+    revision: u64,
+    expected: usize,
+) -> Candidate {
+    h.patch(
+        &format!("[balance]\ntenant-migration = {enabled}\n"),
+        revision,
+    );
+    h.source.deliver();
+    h.applied().await;
+    must(
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(candidate) = sim.router().capture()
+                    && candidate.policy.tenant_migration == enabled
+                    && candidate.routing.backends.backends.len() == expected
+                {
+                    break candidate;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k3_settlement_records_the_scope_that_authorized_execution() -> TestResult {
+    let (h, _) = harness_with(&k3_records(), K3_BACKENDS, true).await?;
+    let sim = simulation(&h);
+    sim_ready(&sim, K3_BACKENDS).await;
+    let on = tenant_migration(&h, &sim, true, 3).await;
+    let session = active_in(&sim, &on, SINGLE_A, None);
+    let queued = accept(&sim, &must(sim.prepare(&session, &on, SINGLE_A2)));
+    assert!(sim.router().revalidate_redirect(&session, SINGLE_A2));
+
+    // During the handshake discovery relabels the destination to ksb, and
+    // the router refreshes before the result settles.
+    let mut records = k3_records_without("127.0.0.1:4006");
+    records.push((KSB_PATH, "127.0.0.1:4006", classic()));
+    let relabelled = republish(&h, &sim, &on, &records, K3_BACKENDS).await;
+    let probe = active_in(&sim, &relabelled, SINGLE_B, None);
+    sim.router().close(&probe);
+    assert_eq!(sim.finish(&queued, true), Settlement::Applied);
+    assert_eq!(active(&sim, SINGLE_A2), 1);
+
+    // The session was authorized as ksa; it is not now a ksb session.
+    let Some(scope) = sim.router().admitted_scope_for_test(&session) else {
+        return Err("session is active".into());
+    };
+    assert_eq!(
+        *scope,
+        control_topology::KeyspaceScope::Single("ksa".into())
+    );
+    assert!(matches!(
+        sim.prepare(&session, &relabelled, SINGLE_B),
+        Err(RouteError::CrossKeyspace)
+    ));
+    sim.router().close(&session);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k3_tenant_sessions_on_shared_backends_meter_their_keyspace() -> TestResult {
+    let (h, _) = harness_with(&k3_records(), K3_BACKENDS, true).await?;
+    let sim = simulation(&h);
+    sim_ready(&sim, K3_BACKENDS).await;
+    let on = tenant_migration(&h, &sim, true, 3).await;
+    let others = |id: &str| -> Vec<String> {
+        on.routing
+            .backends
+            .backends
+            .iter()
+            .map(|backend| backend.backend_id.to_string())
+            .filter(|other| other != id)
+            .collect()
+    };
+    let reserve = |id: &str, keyspace: Option<&str>| {
+        let excluded = others(id);
+        let excluded: Vec<&str> = excluded.iter().map(String::as_str).collect();
+        let session = must(sim.router().open());
+        let reservation = must(sim.router().reserve_in_keyspace(
+            &session,
+            &on,
+            ClientInfo::default(),
+            "",
+            &excluded,
+            keyspace,
+        ));
+        (session, reservation)
+    };
+    // Admission: a tenant session on a shared backend meters its keyspace;
+    // an unprefixed one keeps the empty (detached) keyspace.
+    let (tenant, reservation) = reserve(SHARED_AB, Some("ksa"));
+    assert_eq!(reservation.assignment().keyspace, "ksa");
+    assert_eq!(sim.router().finish(&reservation, true), Settlement::Applied);
+    let (unprefixed, reservation) = reserve(SHARED_AB, None);
+    assert_eq!(reservation.assignment().keyspace, "");
+    assert_eq!(
+        sim.router().finish(&reservation, false),
+        Settlement::Applied
+    );
+    sim.router().close(&unprefixed);
+
+    // shared -> single -> shared keeps the session keyspace on both moves.
+    let to_single = accept(&sim, &must(sim.prepare(&tenant, &on, SINGLE_A)));
+    assert_eq!(
+        (
+            to_single.from().keyspace.as_str(),
+            to_single.to().keyspace.as_str()
+        ),
+        ("ksa", "ksa")
+    );
+    assert!(sim.router().revalidate_redirect(&tenant, SINGLE_A));
+    assert_eq!(sim.finish(&to_single, true), Settlement::Applied);
+    let to_shared = accept(&sim, &must(sim.prepare(&tenant, &on, SHARED_AC)));
+    assert_eq!(to_shared.to().keyspace, "ksa");
+    sim.router().close(&tenant);
     Ok(())
 }

@@ -304,6 +304,11 @@ struct Active {
     /// ([`Ledger::change_user`]).
     keyspace: Option<Arc<str>>,
     redirect: Option<Redirect>,
+    /// The target scope that authorized executing `redirect`, captured when
+    /// the session revalidated it right before capturing state and dialing
+    /// (see [`Ledger::authorize_redirect`]). A successful cross-backend
+    /// redirect records exactly this scope, never a later lookup.
+    redirect_scope: Option<Arc<KeyspaceScope>>,
     failed_at: Option<Instant>,
     closing: Option<ForceClose>,
 }
@@ -747,6 +752,7 @@ impl Ledger {
                 scope: Arc::clone(&reservation.scope),
                 keyspace: reservation.keyspace.clone(),
                 redirect: None,
+                redirect_scope: None,
                 closing: None,
                 failed_at: None,
             }))
@@ -1024,12 +1030,13 @@ impl Ledger {
         };
         if admitted {
             active.redirect = Some(redirect);
+            active.redirect_scope = None;
         } else {
             active.failed_at = Some(now);
         }
     }
 
-    /// [`Self::finish_redirect_scoped`] without a target scope.
+    /// [`Self::finish_redirect_scoped`] for a legacy namespace.
     #[cfg(test)]
     pub(crate) fn finish_redirect(
         &mut self,
@@ -1037,20 +1044,56 @@ impl Ledger {
         success: bool,
         now: Instant,
     ) -> Settlement {
-        self.finish_redirect_scoped(redirect, success, now, None)
+        self.finish_redirect_scoped(redirect, success, now, false)
+    }
+
+    /// The source and target accounts of `session`'s accepted, unsettled
+    /// redirect.
+    pub(crate) fn pending_redirect(
+        &self,
+        session: &Session,
+    ) -> Option<(&Arc<AccountIdentity>, &Arc<AccountIdentity>)> {
+        match self.stage(session) {
+            Ok(Stage::Active(active)) => active
+                .redirect
+                .as_ref()
+                .map(|redirect| (&redirect.source, &redirect.target)),
+            _ => None,
+        }
+    }
+
+    /// Records that `session`'s pending redirect was revalidated for
+    /// execution, authorized by the target's `scope` (`None` for a reconnect
+    /// to its own backend, which keeps the recorded scope).
+    pub(crate) fn authorize_redirect(
+        &mut self,
+        session: &Session,
+        scope: Option<Arc<KeyspaceScope>>,
+    ) {
+        if !Arc::ptr_eq(&session.ledger, &self.identity) {
+            return;
+        }
+        if let Some(Stage::Active(active)) = self.sessions.get_mut(&session.sequence)
+            && active.redirect.is_some()
+        {
+            active.redirect_scope = scope;
+        }
     }
 
     /// Settles an accepted redirect. On success onto another backend the
-    /// session records `target_scope`, the target's discovery scope as the
-    /// router knows it at settlement, so later tenant checks judge the
-    /// session by the backend it now lives on. A reconnect to the same
-    /// backend keeps the recorded scope.
+    /// session records the target scope that authorized its execution
+    /// ([`Self::authorize_redirect`]), so later tenant checks judge it by the
+    /// backend it was verified to land on, never by a record the router
+    /// learned later. In a `tenant_aware` namespace a redirect that was never
+    /// authorized records a scope that serves no tenant (pinned); a legacy
+    /// namespace keeps the recorded scope. A reconnect to the same backend
+    /// keeps the recorded scope.
     pub(crate) fn finish_redirect_scoped(
         &mut self,
         redirect: &Redirect,
         success: bool,
         now: Instant,
-        target_scope: Option<Arc<KeyspaceScope>>,
+        tenant_aware: bool,
     ) -> Settlement {
         let Ok(Stage::Active(active)) = self.stage(&redirect.session) else {
             return Settlement::Ignored;
@@ -1095,13 +1138,18 @@ impl Ledger {
             unreachable!("matching active session")
         };
         active.redirect = None;
+        let authorized = active.redirect_scope.take();
         if success {
             active.account = Arc::clone(&redirect.target);
             active.assignment = redirect.to.clone();
-            if !Arc::ptr_eq(&redirect.source, &redirect.target)
-                && let Some(scope) = target_scope
-            {
-                active.scope = scope;
+            if !Arc::ptr_eq(&redirect.source, &redirect.target) {
+                match authorized {
+                    Some(scope) => active.scope = scope,
+                    None if tenant_aware => {
+                        active.scope = Arc::new(KeyspaceScope::Unverified(String::new()));
+                    }
+                    None => {}
+                }
             }
             active.failed_at = None;
         } else {

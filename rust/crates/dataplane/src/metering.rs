@@ -465,6 +465,32 @@ impl MeteringSourceRegistry {
             .map_err(|_| MeteringSamplerError::RegistryPoisoned)
     }
 
+    /// Returns `(backend_id, keyspace)` of every source generation still owned
+    /// by the sampler, in `(connection, backend generation)` order. Like
+    /// [`Self::active_source_count`], a diagnostic/testing surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns when registry ownership was poisoned.
+    pub fn active_source_attributions(
+        &self,
+    ) -> Result<Vec<(String, String)>, MeteringSamplerError> {
+        self.sources
+            .lock()
+            .map(|sources| {
+                sources
+                    .values()
+                    .map(|source| {
+                        (
+                            source.attribution.backend_id.clone(),
+                            source.attribution.keyspace.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|_| MeteringSamplerError::RegistryPoisoned)
+    }
+
     /// Registers a successfully attached backend source backed by the exact
     /// raw counters used from dial through handshake/auth/restore.
     ///

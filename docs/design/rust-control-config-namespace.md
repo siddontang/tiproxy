@@ -291,9 +291,25 @@ labels or the assignment keyspace derived from them.
   change-user) may move only within the verified single keyspace it was
   admitted on, and only while its current source is still that keyspace; a
   session admitted on a shared or unverified record stays pinned.
-- A successful move records the target's scope as the session's scope.
-- Balancing plans backend pairs without a session keyspace, so it may skip
-  rounds that involve shared backends; each offer re-checks the session.
+- An accepted redirect can wait for a transaction boundary. Right before the
+  session engine captures session state and dials the target, it revalidates
+  the redirect with the router against a fresh snapshot: the gate is still
+  on, the session keyspace (after any change-user) still qualifies, and the
+  target is still a current, verified record serving it. On refusal the
+  redirect fails without any I/O to the target and the session keeps its
+  source backend.
+- A successful move records, as the session's scope, the target scope that
+  authorized that execution, never a record learned later (a destination
+  relabelled during the handshake does not become the session's tenant). A
+  reconnect to the same backend keeps the recorded scope.
+- Balancing and failover plan backend pairs whose verified scopes share a
+  tenant (shared and single-keyspace backends included); every offer of the
+  pair re-checks its own session as above, so sessions of other tenants on
+  the source are refused.
+- Metering (design K4, brought forward for tenant sessions only): a tenant
+  session on a shared backend is attributed to its session keyspace, at
+  admission and when it moves onto one, instead of the empty keyspace that
+  detaches metering. Every other assignment keeps its keyspace.
 
 Example `/config/ns/tenants` value:
 

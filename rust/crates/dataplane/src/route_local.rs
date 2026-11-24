@@ -43,6 +43,7 @@ trait LocalRouteAuthority: Send + Sync {
     ) -> Result<RouteAssignment, RouteError>;
     fn finish(&mut self, assignment_id: &str, connected: bool) -> Option<Settlement>;
     fn change_user(&self, user: &str) -> bool;
+    fn revalidate_redirect(&self, target_id: &str) -> bool;
 }
 
 struct PlaneRouteAuthority {
@@ -87,6 +88,10 @@ impl LocalRouteAuthority for PlaneRouteAuthority {
 
     fn change_user(&self, user: &str) -> bool {
         self.admission.selector().change_user(user)
+    }
+
+    fn revalidate_redirect(&self, target_id: &str) -> bool {
+        self.admission.selector().revalidate_redirect(target_id)
     }
 }
 
@@ -176,6 +181,14 @@ impl LocalRouteChannel {
     #[must_use = "callers may log or count a cleared session keyspace"]
     pub fn change_user(&self, user: &str) -> bool {
         self.authority.change_user(user)
+    }
+
+    /// Revalidates this session's accepted redirect to `target_id` right
+    /// before the engine captures session state and dials it. `false` means
+    /// the redirect must fail without any I/O to the target.
+    #[must_use = "a refused redirect must not be executed"]
+    pub fn revalidate_redirect(&self, target_id: &str) -> bool {
+        self.authority.revalidate_redirect(target_id)
     }
 
     fn terminal(&self, error: RouteError) -> RouteAssignment {
@@ -298,6 +311,7 @@ mod tests {
         calls: Vec<(String, String, String)>,
         finishes: Vec<(String, bool)>,
         changed_users: Vec<String>,
+        revalidated: Vec<String>,
         drops: usize,
         active: usize,
     }
@@ -383,6 +397,15 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .changed_users
                 .push(user.to_owned());
+            true
+        }
+
+        fn revalidate_redirect(&self, target_id: &str) -> bool {
+            self.observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .revalidated
+                .push(target_id.to_owned());
             true
         }
     }
@@ -668,6 +691,14 @@ mod tests {
     #[test]
     fn change_user_reaches_the_session_route_authority() {
         let (channel, observed) = channel([]);
+        assert!(channel.revalidate_redirect("backend-b"));
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .revalidated,
+            ["backend-b".to_owned()]
+        );
         assert!(channel.change_user("ks2.app"));
         assert_eq!(
             observed

@@ -4352,6 +4352,19 @@ impl Engine {
         // owner at the FSM safe boundary. MIG-01 consumes the validated
         // token/state only inside this task, builds a fully restored candidate,
         // and exposes it to the FSM only after the restore OK is consumed.
+        //
+        // An accepted redirect may have waited here for a transaction
+        // boundary while the session (COM_CHANGE_USER), discovery or the
+        // tenant-migration gate changed. Revalidate it with the session's
+        // router before any state is captured or the target is dialed; on
+        // refusal the old backend stays the untouched sole owner and
+        // nothing reaches the target.
+        if let (Some(target), Some(lease)) = (&self.redirect_target, &self.local_route_lease)
+            && !lease.revalidate_redirect(&target.backend_id)
+        {
+            let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+            return;
+        }
         match self.capture_migration_snapshot().await {
             Ok(snapshot) => {
                 if let Some(state) = self.cmd_state.as_mut() {

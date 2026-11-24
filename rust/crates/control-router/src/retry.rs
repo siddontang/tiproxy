@@ -58,6 +58,13 @@ impl Selector {
         self.router.change_user(&self.session, user)
     }
 
+    /// Revalidates this session's accepted redirect to `target_id` right
+    /// before execution; see [`Router::revalidate_redirect`].
+    #[must_use = "a refused redirect must not be executed"]
+    pub fn revalidate_redirect(&self, target_id: &str) -> bool {
+        self.router.revalidate_redirect(&self.session, target_id)
+    }
+
     /// Binds the client-selected keyspace for every attempt of this cycle.
     pub(crate) fn set_keyspace(&mut self, keyspace: Option<&str>) {
         self.keyspace = keyspace.map(Arc::from);
