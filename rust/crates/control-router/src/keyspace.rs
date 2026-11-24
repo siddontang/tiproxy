@@ -189,6 +189,18 @@ mod tests {
     }
 
     #[test]
+    fn unverified_record_serves_legacy_and_unprefixed_logins_only() {
+        let backends = [backend("a:1", KeyspaceScope::Unverified("ksb".into()))];
+        assert_eq!(admitted(&backends, KeyspaceFilter::Legacy), ["a:1"]);
+        assert_eq!(admitted(&backends, KeyspaceFilter::Unprefixed), ["a:1"]);
+        assert!(admitted(&backends, KeyspaceFilter::Keyspace("ksb")).is_empty());
+        assert_eq!(
+            admission_filter(&backends, true, Some("ksb")),
+            Err(RouteError::KeyspaceNotServed)
+        );
+    }
+
+    #[test]
     fn keyspace_routing_refuses_an_unserved_keyspace_whatever_discovery_shows() {
         let without_shared = [
             backend("c:1", KeyspaceScope::Single("ks1".into())),

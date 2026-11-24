@@ -25,7 +25,9 @@
 //! `/topology/tidb/<addr>/info` path and adds `"multi_keyspace": true` plus a
 //! `"keyspaces"` allow-list (or `"*"` for any keyspace). Such a backend is
 //! modelled as [`KeyspaceScope::Set`] / [`KeyspaceScope::Any`]; every other
-//! record keeps the Go single-keyspace projection ([`KeyspaceScope::Single`]).
+//! record keeps the Go single-keyspace projection ([`KeyspaceScope::Single`]),
+//! or [`KeyspaceScope::Unverified`] when only the legacy liveness fallback
+//! keeps it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -61,6 +63,14 @@ pub enum KeyspaceScope {
     Set(BTreeSet<String>),
     /// A multi-keyspace node that advertised `"*"` (any keyspace, dev mode).
     Any,
+    /// A single-keyspace record (path keyspace kept, empty for classic) that
+    /// is live only through the legacy Go fallback: no record at the address
+    /// has the `ttl` of its own path, but another path's `ttl` does (e.g. a
+    /// stale keyspace-B record while keyspace A has registered its `ttl` but
+    /// not yet its `info`). Its tenant is unknown, so it serves no
+    /// `<keyspace>.<user>` login under tenant-aware admission; legacy
+    /// consumers still see the path keyspace, exactly as Go does.
+    Unverified(String),
 }
 
 impl Default for KeyspaceScope {
@@ -84,16 +94,18 @@ impl KeyspaceScope {
             Self::Single(own) => own == keyspace,
             Self::Set(keyspaces) => keyspaces.contains(keyspace),
             Self::Any => true,
+            Self::Unverified(_) => false,
         }
     }
 
     /// The single-keyspace projection used by existing per-backend consumers
     /// (assignment keyspace, metering, migration guards). A shared backend has
-    /// no single keyspace and projects to the empty string.
+    /// no single keyspace and projects to the empty string; an unverified
+    /// record keeps its path keyspace for Go parity.
     #[must_use]
     pub fn single_keyspace(&self) -> &str {
         match self {
-            Self::Single(keyspace) => keyspace,
+            Self::Single(keyspace) | Self::Unverified(keyspace) => keyspace,
             Self::Set(_) | Self::Any => "",
         }
     }
@@ -478,8 +490,11 @@ fn split_topology_key(key: &str) -> Option<(String, &str)> {
 ///    a live registration, which tenant-aware admission relies on.
 /// 3. Only when no record at the address has its own `ttl` does the legacy Go
 ///    rule apply: the last-parsed single-keyspace record, live with any `ttl`
-///    for the address. Legacy routing differs from Go only where a record
-///    lacks its own `ttl` while another record at the same address has one.
+///    for the address. Its scope becomes [`KeyspaceScope::Unverified`] (path
+///    keyspace kept), so legacy routing sees it as Go does while tenant-aware
+///    admission never selects it for a prefixed login. Legacy routing differs
+///    from Go only where a record lacks its own `ttl` while another record at
+///    the same address has one.
 #[must_use]
 pub fn parse_tidb_topology(entries: &[(Vec<u8>, Vec<u8>)]) -> TopologySnapshot {
     /// One single-keyspace record: its etcd `info` key, path keyspace and value.
@@ -555,12 +570,17 @@ pub fn parse_tidb_topology(entries: &[(Vec<u8>, Vec<u8>)]) -> TopologySnapshot {
             })
             .map(|(index, _)| index);
         let chosen = match paired {
-            Some(index) => Some(index),
-            None if alive.contains(&addr) => records.len().checked_sub(1),
+            Some(index) => Some((index, true)),
+            None if alive.contains(&addr) => records.len().checked_sub(1).map(|last| (last, false)),
             None => None,
         };
-        if let Some(index) = chosen {
-            backends.extend(records.into_iter().nth(index).map(|record| record.info));
+        if let Some((index, verified)) = chosen
+            && let Some(mut record) = records.into_iter().nth(index)
+        {
+            if !verified {
+                record.info.serves = KeyspaceScope::Unverified(record.path_keyspace);
+            }
+            backends.push(record.info);
         }
     }
     backends.sort_by(|left, right| left.addr.cmp(&right.addr));
@@ -1006,7 +1026,19 @@ mod tests {
             ),
             kv("/keyspaces/tidb/ksa/topology/tidb/10.0.0.1:4000/ttl", "1"),
         ]);
-        assert_eq!(backend.serves, KeyspaceScope::Single("ksb".to_owned()));
+        assert_eq!(backend.serves, KeyspaceScope::Unverified("ksb".to_owned()));
+        assert_eq!(backend.keyspace(), "ksb", "legacy consumers keep Go's view");
+        assert!(!backend.serves.serves("ksb") && !backend.serves.serves("ksa"));
+        assert!(!backend.serves.is_shared());
+        // A classic record kept the same way is unverified too.
+        let classic = only_backend(&[
+            kv(
+                "/topology/tidb/10.0.0.1:4000/info",
+                &info_value("10.0.0.1", 3),
+            ),
+            kv("/keyspaces/tidb/ksa/topology/tidb/10.0.0.1:4000/ttl", "1"),
+        ]);
+        assert_eq!(classic.serves, KeyspaceScope::Unverified(String::new()));
     }
 
     #[test]

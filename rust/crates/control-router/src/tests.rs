@@ -243,6 +243,23 @@ impl KvFixture {
     /// Publishes exact `(info key prefix, addr, info JSON)` records, each with
     /// a `ttl` sibling under the same prefix. The prefix is either
     /// `/topology/tidb/` or `/keyspaces/tidb/<ks>/topology/tidb/`.
+    /// Publishes exact raw `(key, value)` records, e.g. a `ttl` without its
+    /// `info` sibling.
+    fn raw_records(&self, records: &[(String, Vec<u8>)]) {
+        *self
+            .service
+            .records
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = records
+            .iter()
+            .map(|(key, value)| KeyValue {
+                key: key.clone().into_bytes(),
+                mod_revision: 7,
+                value: value.clone(),
+            })
+            .collect();
+    }
+
     fn info_records(&self, records: &[(&str, &str, serde_json::Value)]) {
         let mut out = Vec::new();
         for (prefix, addr, info) in records {

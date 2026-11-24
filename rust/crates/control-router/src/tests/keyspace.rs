@@ -397,6 +397,78 @@ async fn route_plane_admission_refuses_an_unserved_prefix() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partially_registered_address_is_not_admitted_for_a_stale_tenant() -> TestResult {
+    const ADDR: &str = "127.0.0.1:4000";
+    const BACKEND: &str = "default/127.0.0.1:4000";
+    let (h, _) = harness_with(&[(PROCESS, "127.0.0.1:4002", classic())], 1, true).await?;
+    let (plane, mut handle) = RoutePlane::new(Arc::new(h.source.clone()), h.topology.clone(), None);
+    let context = h.runtime.handle().module_context();
+    let plane_task = tokio::spawn(async move { Box::new(plane).run(context).await });
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_ready()).await??;
+
+    let info = |ks: &str| {
+        (
+            format!("/keyspaces/tidb/{ks}/topology/tidb/{ADDR}/info"),
+            must(serde_json::to_vec(&classic())),
+        )
+    };
+    let ttl = |ks: &str| {
+        (
+            format!("/keyspaces/tidb/{ks}/topology/tidb/{ADDR}/ttl"),
+            b"1".to_vec(),
+        )
+    };
+    // The address moved from ksb to ksa: ksb's info is stale (its own ttl
+    // expired), ksa has registered its ttl but not yet its info.
+    h.fixture.raw_records(&[info("ksb"), ttl("ksa")]);
+    let partial = published(&h, &h.ready().await, 1).await;
+    assert_eq!(
+        partial.routing.backends.backends[0].backend.serves,
+        control_topology::KeyspaceScope::Unverified("ksb".to_owned()),
+        "fixture: the legacy fallback keeps the stale record, tenant unknown"
+    );
+    let refused = tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if matches!(handle.admit("ksb.user"), Err(RouteError::KeyspaceNotServed)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(refused.is_ok(), "a stale tenant gets no assignment");
+    assert!(matches!(
+        handle.admit("ksa.user"),
+        Err(RouteError::KeyspaceNotServed)
+    ));
+
+    // ksa's info arrives: the address is now verified for ksa only.
+    h.fixture
+        .raw_records(&[info("ksb"), info("ksa"), ttl("ksa")]);
+    let mut admitted = None;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            if let Ok(admission) = handle.admit("ksa.user") {
+                admitted = Some(admission);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
+    let mut admission = admitted.ok_or("ksa admitted")?;
+    let reservation = must(admission.selector_mut().next(ClientInfo::default(), ""));
+    assert_eq!(reservation.assignment().backend_id, BACKEND);
+    assert!(matches!(
+        handle.admit("ksb.user"),
+        Err(RouteError::KeyspaceNotServed)
+    ));
+    drop(admission);
+    plane_task.abort();
+    Ok(())
+}
+
 fn simulation(h: &Harness) -> MigrationSimulation {
     must(MigrationSimulation::new(
         Arc::new(h.source.clone()),
