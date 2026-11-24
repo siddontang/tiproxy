@@ -104,6 +104,7 @@ label-name = "zone"
 routing-rule = "client_cidr"
 policy = "location"
 routing-policy = "random"
+tenant-migration = true
 
 [balance.status]
 migrations-per-second = 1.5

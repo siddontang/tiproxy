@@ -179,3 +179,47 @@ fn routing_rule_reloads_and_restart_fields_match_the_contract() {
         (ReloadClass::Dynamic, FieldEffect::Inert)
     );
 }
+
+#[test]
+fn tenant_migration_defaults_off_and_reloads_dynamically() {
+    let store = ConfigNamespaceStore::from_toml(b"", None, Path::new("/tmp"))
+        .unwrap_or_else(|error| unreachable!("defaults: {error}"));
+    let routing = |store: &ConfigNamespaceStore| {
+        store
+            .current()
+            .effective()
+            .routing()
+            .unwrap_or_else(|error| unreachable!("routing projection: {error}"))
+    };
+    let checksum = |store: &ConfigNamespaceStore| store.current().effective().go_checksum();
+    let default_checksum = checksum(&store);
+    assert!(!routing(&store).tenant_migration);
+    // Go `omitempty`: an explicit `false` leaves the canonical output alone.
+    store
+        .apply_toml(
+            b"[balance]\ntenant-migration = false\n",
+            None,
+            2,
+            Path::new("/tmp"),
+        )
+        .unwrap_or_else(|error| unreachable!("explicit false: {error}"));
+    assert_eq!(checksum(&store), default_checksum);
+    store
+        .apply_toml(
+            b"[balance]\ntenant-migration = true\n",
+            None,
+            3,
+            Path::new("/tmp"),
+        )
+        .unwrap_or_else(|error| unreachable!("tenant-migration reload: {error}"));
+    assert!(routing(&store).tenant_migration);
+    assert_ne!(checksum(&store), default_checksum);
+    let entry = field_contract()
+        .iter()
+        .find(|entry| entry.field == "balance.tenant-migration")
+        .unwrap_or_else(|| unreachable!("tenant-migration contract"));
+    assert_eq!(
+        (entry.reload, entry.effect),
+        (ReloadClass::Dynamic, FieldEffect::Applied)
+    );
+}

@@ -124,6 +124,7 @@ fn routing_projection_has_go_compatible_defaults() {
     assert!(routing.proxy_labels.is_empty());
     assert!(routing.failed_backends.is_empty());
     assert_eq!(routing.failover_timeout_seconds, 60);
+    assert!(!routing.tenant_migration);
     for rate in [
         routing.status.migrations_per_second,
         routing.health.migrations_per_second,
@@ -150,6 +151,7 @@ label-name = "tenant"
 routing-rule = "port"
 policy = "location"
 routing-policy = "random"
+tenant-migration = true
 
 [balance.status]
 migrations-per-second = 1.5
@@ -200,6 +202,7 @@ region = "r1"
         vec!["tidb-1:4000", "tidb-2"]
     );
     assert_eq!(routing.failover_timeout_seconds, 17);
+    assert!(routing.tenant_migration);
     assert_same_float(routing.status.migrations_per_second, 1.5);
     assert_same_float(routing.health.migrations_per_second, 2.5);
     assert_same_float(routing.memory.migrations_per_second, 3.5);
@@ -1065,7 +1068,7 @@ fn canonical_full_config_checksum_matches_production_go_encoder() {
     let store = ConfigNamespaceStore::from_toml(data, None, current_dir())
         .unwrap_or_else(|error| unreachable!("full parity fixture: {error}"));
     // Generated from lib/config.Config.ToBytes using the same full fixture.
-    assert_eq!(store.current().config_checksum(), 2_137_169_756);
+    assert_eq!(store.current().config_checksum(), 17_713_998);
 }
 
 fn proxy_max_connections(snapshot: &control_config::ConfigNamespaceSnapshot) -> u64 {

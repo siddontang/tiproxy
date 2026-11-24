@@ -230,6 +230,7 @@ would activate the value is rejected by the serving validator.
 | `rsa-key-size`, `autocert-expire-duration` below every global TLS block | Dynamic, inert unless auto-certs | Canonically round-tripped; because auto-certs is unsupported, these fields do not generate material in #146. |
 | `log.level`, every `filename`, `max-size`, `max-days`, `max-backups` below `log.log-file` | Dynamic | Level is applied by CP-001; file sink changes are retained for CP-ADMIN/log ownership. |
 | `balance.label-name`, `.policy`, `.routing-policy`; `migrations-per-second` below `.status`, `.health`, `.memory`, `.cpu`, `.location`, `.conn-count`; `.conn-count.count-ratio-threshold` | Dynamic | Validated and retained for CP-ROUTE. |
+| `balance.tenant-migration` | Dynamic | Default `false` (omitted from the canonical output, like Go `omitempty`). Applies only to namespaces with `keyspace-routing = true`; see that setting below. Inert in the Go router, which has no tenant-aware namespaces. Keep it off until `TiDB` binds the session token to its tenant. |
 | every `labels.<key>` | Dynamic | Stable map projection for CP-TOPO/CP-ROUTE. |
 | `enable-traffic-replay` | Dynamic, inert | The Go default `true` is accepted and SQL serving starts. Capture and replay are not implemented: the traffic API answers `unsupported` when the flag is true and `disabled` when it is false. `rust-dataplane.enabled` together with this flag still fails `Config.Check`. |
 

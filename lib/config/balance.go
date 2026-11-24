@@ -33,6 +33,14 @@ type Balance struct {
 	CPU           Factor          `yaml:"cpu,omitempty" toml:"cpu,omitempty" json:"cpu,omitempty" reloadable:"true"`
 	Location      Factor          `yaml:"location,omitempty" toml:"location,omitempty" json:"location,omitempty" reloadable:"true"`
 	ConnCount     ConnCountFactor `yaml:"conn-count,omitempty" toml:"conn-count,omitempty" json:"conn-count,omitempty" reloadable:"true"`
+
+	// TenantMigration enables session redirects in Rust namespaces with
+	// keyspace-routing, where the target must serve the session's tenant,
+	// including to and from multi-keyspace (shared) TiDB backends. It is off
+	// by default and has no effect on the Go router, which has no tenant-aware
+	// namespaces. The TOML encoder writes plain keys before sub-tables, so its
+	// position here does not change the canonical output order.
+	TenantMigration bool `yaml:"tenant-migration,omitempty" toml:"tenant-migration,omitempty" json:"tenant-migration,omitempty" reloadable:"true"`
 }
 
 type ConnCountFactor struct {
