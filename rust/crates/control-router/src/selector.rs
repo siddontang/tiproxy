@@ -594,12 +594,12 @@ impl Router {
         // restoration until valid routing labels have admitted this backend.
         backend.group.ok_or(RouteError::NoBackend)?;
         let account = Arc::clone(&backend.account);
-        let shared = backend.source.backend.serves.is_shared();
+        let pinned = !crate::keyspace::migratable(&backend.source, self.sources.keyspace_routing());
         let result = assignment(&backend.source, candidate.health.get(id).local);
         self.sources.validate(&candidate)?;
         let reservation = state
             .ledger
-            .reserve_scoped(session, &account, result, shared)?;
+            .reserve_scoped(session, &account, result, pinned)?;
         let result = reservation.assignment().clone();
         let settled = state.ledger.finish(&reservation, true);
         debug_assert_eq!(settled, Settlement::Applied);
@@ -781,12 +781,12 @@ impl Router {
         let backend = choices[index].0;
         let identity = Arc::clone(&backend.account);
         let local = candidate.health.get(&backend.source.backend_id).local;
-        let shared = backend.source.backend.serves.is_shared();
+        let pinned = !crate::keyspace::migratable(&backend.source, self.sources.keyspace_routing());
         let assignment = assignment(&backend.source, local);
         self.sources.validate(candidate)?;
         state
             .ledger
-            .reserve_scoped(session, &identity, assignment, shared)
+            .reserve_scoped(session, &identity, assignment, pinned)
             .map_err(Into::into)
     }
 
@@ -848,14 +848,15 @@ impl Router {
                 .ok_or(RouteError::NoBackend)?;
             let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
             let identity = Arc::clone(&backend.account);
-            let shared = backend.source.backend.serves.is_shared();
+            let pinned =
+                !crate::keyspace::migratable(&backend.source, self.sources.keyspace_routing());
             let assignment = assignment(&backend.source, candidate.health.get(id).local);
             // Metrics qualify input data only. C/R/H and the ledger authorize
             // the effect, under this same lock and (when present) metric fence.
             self.sources.validate(candidate)?;
             let reserved = state
                 .ledger
-                .reserve_scoped(session, &identity, assignment, shared)?;
+                .reserve_scoped(session, &identity, assignment, pinned)?;
             if metrics.is_some()
                 && let Some(diagnostics) = &self.input_diagnostics
             {
@@ -969,10 +970,15 @@ impl Router {
         let source = Arc::clone(state.ledger.active_owner(session)?);
         // The admission-time fact, not the address's current scope: a record
         // flipping from shared to single must not make this session movable.
-        if state.ledger.admitted_shared(session) {
+        if !state.session_migratable(session, self.sources.keyspace_routing()) {
             return Err(RouteError::CrossKeyspace);
         }
-        let target = state.redirect_target(&source, candidate, target_id)?;
+        let target = state.redirect_target(
+            &source,
+            candidate,
+            target_id,
+            self.sources.keyspace_routing(),
+        )?;
         self.sources.validate(candidate)?;
         Ok(crate::PreparedRedirect {
             session: session.clone(),
@@ -1054,11 +1060,18 @@ impl Router {
         }
         state.refresh(&prepared.candidate)?;
         // Every offer (direct, balance, failover-driven) funnels through here;
-        // a session admitted on a shared backend stays ineligible until close.
-        let target = if state.ledger.admitted_shared(&prepared.session) {
-            Err(RouteError::CrossKeyspace)
+        // a pinned session, or one whose address changed tenant, stays
+        // ineligible until close.
+        let target = if state.session_migratable(&prepared.session, self.sources.keyspace_routing())
+        {
+            state.redirect_target(
+                &prepared.source,
+                &prepared.candidate,
+                &prepared.target_id,
+                self.sources.keyspace_routing(),
+            )
         } else {
-            state.redirect_target(&prepared.source, &prepared.candidate, &prepared.target_id)
+            Err(RouteError::CrossKeyspace)
         };
         let target = match target {
             Ok(target) => target,
@@ -1114,10 +1127,11 @@ impl Router {
             summary.active = state.ledger.evidence().active;
             for session in state.ledger.redirectable_sessions() {
                 summary.offered += 1;
-                // Shared-backend migration stays disabled until it is
-                // qualified end to end, by the session's admission-time fact
-                // and by the current scope; a refused offer is not an error.
-                if state.ledger.admitted_shared(&session) || state.on_shared_backend(&session) {
+                // A reconnect is a migration too: refused for a session
+                // pinned at admission (shared, or unverified under keyspace
+                // routing) and for an owner whose current scope is not
+                // migratable; a refused offer is not an error.
+                if !state.session_migratable(&session, self.sources.keyspace_routing()) {
                     continue;
                 }
                 let Ok(redirect) = state.ledger.prepare_self_redirect(&session, now) else {
@@ -1292,15 +1306,36 @@ fn group_values(backend: &MergedBackend, rule: MatchType) -> Vec<String> {
 }
 
 impl State {
-    /// Whether `session` is physically owned by a shared (multi-keyspace)
-    /// backend. Unknown owners are reported as not shared.
-    fn on_shared_backend(&self, session: &Session) -> bool {
-        let Ok(owner) = self.ledger.active_owner(session) else {
+    /// Whether `session` may be offered any redirect, including a reconnect
+    /// to its own backend. The target side is checked by `redirect_target`.
+    ///
+    /// Refused when the session was pinned at admission (shared, or an
+    /// unverified tenant under keyspace routing) or its owner's current scope
+    /// is not migratable. In a `keyspace-routing` namespace the session's
+    /// retained admission keyspace must also still equal its owner's current
+    /// keyspace: an address that changed tenant (verified B to verified A)
+    /// under an open B session must not let that session be moved to an A
+    /// backend or reconnected to the reused address. `redirect_target` then
+    /// requires the target keyspace to equal the current source keyspace, so
+    /// admission == source == target. An unknown owner is refused.
+    fn session_migratable(&self, session: &Session, keyspace_routing: bool) -> bool {
+        if self.ledger.admitted_pinned(session) {
+            return false;
+        }
+        let (Ok(owner), Some(admitted)) = (
+            self.ledger.active_owner(session),
+            self.ledger.admitted_keyspace(session),
+        ) else {
             return false;
         };
-        self.backends.values().any(|backend| {
-            Arc::ptr_eq(&backend.account, owner) && backend.source.backend.serves.is_shared()
-        })
+        self.backends
+            .values()
+            .find(|backend| Arc::ptr_eq(&backend.account, owner))
+            .is_some_and(|backend| {
+                crate::keyspace::migratable(&backend.source, keyspace_routing)
+                    && (!keyspace_routing
+                        || assignment(&backend.source, false).keyspace == admitted)
+            })
     }
 
     fn redirect_target(
@@ -1308,6 +1343,7 @@ impl State {
         source: &Arc<AccountIdentity>,
         candidate: &Candidate,
         target_id: &str,
+        keyspace_routing: bool,
     ) -> Result<&Backend, RouteError> {
         let physical = self
             .backends
@@ -1331,11 +1367,13 @@ impl State {
             return Err(RouteError::SameBackend);
         }
         // Shared (multi-keyspace) backends project to an empty assignment
-        // keyspace, so the equality below cannot tell their tenants apart.
-        // Until shared-backend migration is qualified end to end, neither
-        // side of a cross-backend migration may be a shared backend; this
-        // reuses the cross-keyspace refusal, so balance skips the round.
-        if physical.source.backend.serves.is_shared() || target.source.backend.serves.is_shared() {
+        // keyspace and unverified records project to a tenant nobody
+        // confirmed, so the equality below cannot be trusted for either.
+        // Both sides must be migratable; this reuses the cross-keyspace
+        // refusal, so balance skips the round.
+        if !crate::keyspace::migratable(&physical.source, keyspace_routing)
+            || !crate::keyspace::migratable(&target.source, keyspace_routing)
+        {
             return Err(RouteError::CrossKeyspace);
         }
         if assignment(&physical.source, false).keyspace

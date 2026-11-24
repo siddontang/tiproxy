@@ -178,9 +178,10 @@ pub struct Reservation {
     sequence: u64,
     account: Arc<AccountIdentity>,
     assignment: RouteAssignment,
-    /// Whether the selected backend was shared (multi-keyspace) when this
-    /// attempt was reserved; carried to the active session until close.
-    shared: bool,
+    /// Whether the selected backend was not migratable (shared, or an
+    /// unverified tenant under keyspace routing) when this attempt was
+    /// reserved; carried to the active session until close.
+    pinned: bool,
 }
 
 impl Reservation {
@@ -287,9 +288,9 @@ impl ForceClose {
 struct Active {
     account: Arc<AccountIdentity>,
     assignment: RouteAssignment,
-    /// Admitted on a shared backend. Recorded once and never re-read from
-    /// discovery, because the account outlives a changed address record.
-    shared: bool,
+    /// Admitted on a non-migratable backend. Recorded once and never re-read
+    /// from discovery, because the account outlives a changed address record.
+    pinned: bool,
     redirect: Option<Redirect>,
     failed_at: Option<Instant>,
     closing: Option<ForceClose>,
@@ -651,13 +652,13 @@ impl Ledger {
         self.reserve_scoped(session, identity, assignment, false)
     }
 
-    /// [`Self::reserve`] recording whether the backend is shared.
+    /// [`Self::reserve`] recording whether the backend is migratable.
     pub(crate) fn reserve_scoped(
         &mut self,
         session: &Session,
         identity: &Arc<AccountIdentity>,
         mut assignment: RouteAssignment,
-        shared: bool,
+        pinned: bool,
     ) -> Result<Reservation, LedgerError> {
         if let Some(reservation) = self.pending(session)? {
             return Ok(reservation);
@@ -679,7 +680,7 @@ impl Ledger {
             sequence: self.next_reservation,
             account: Arc::clone(identity),
             assignment,
-            shared,
+            pinned,
         };
         // All fallible checks precede the first counter or state change.
         self.next_reservation = next;
@@ -719,7 +720,7 @@ impl Ledger {
             Stage::Active(Box::new(Active {
                 account: Arc::clone(&reservation.account),
                 assignment: reservation.assignment.clone(),
-                shared: reservation.shared,
+                pinned: reservation.pinned,
                 redirect: None,
                 closing: None,
                 failed_at: None,
@@ -744,9 +745,18 @@ impl Ledger {
             .collect()
     }
 
-    /// Whether this active session was admitted on a shared backend.
-    pub(crate) fn admitted_shared(&self, session: &Session) -> bool {
-        matches!(self.stage(session), Ok(Stage::Active(active)) if active.shared)
+    /// The keyspace retained in this active session's current assignment
+    /// (its admission assignment until a redirect succeeds).
+    pub(crate) fn admitted_keyspace(&self, session: &Session) -> Option<&str> {
+        match self.stage(session) {
+            Ok(Stage::Active(active)) => Some(&active.assignment.keyspace),
+            _ => None,
+        }
+    }
+
+    /// Whether this active session was admitted on a non-migratable backend.
+    pub(crate) fn admitted_pinned(&self, session: &Session) -> bool {
+        matches!(self.stage(session), Ok(Stage::Active(active)) if active.pinned)
     }
 
     pub(crate) fn active_owner(

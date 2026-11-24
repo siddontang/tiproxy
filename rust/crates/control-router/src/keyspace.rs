@@ -80,6 +80,20 @@ pub(crate) fn admission_filter<'a>(
     }
 }
 
+/// Whether `backend` may be a migration source or target (including a
+/// reconnect to itself). Shared backends never are, until shared-backend
+/// migration is qualified end to end. In a `keyspace-routing` namespace the
+/// tenant must also be verified, so an [`KeyspaceScope::Unverified`] record
+/// (live only through the legacy liveness fallback) is excluded too; legacy
+/// namespaces keep Go's view of such a record.
+///
+/// [`KeyspaceScope::Unverified`]: control_topology::KeyspaceScope::Unverified
+pub(crate) fn migratable(backend: &MergedBackend, keyspace_routing: bool) -> bool {
+    let scope = &backend.backend.serves;
+    let unverified = matches!(scope, control_topology::KeyspaceScope::Unverified(_));
+    !(scope.is_shared() || keyspace_routing && unverified)
+}
+
 /// Whether `backend` is a candidate under an (already resolved) filter.
 pub(crate) fn admits(backend: &MergedBackend, filter: KeyspaceFilter<'_>) -> bool {
     match filter {
@@ -186,6 +200,18 @@ mod tests {
             Ok(KeyspaceFilter::Unprefixed)
         );
         assert_eq!(admitted(&backends, KeyspaceFilter::Unprefixed).len(), 4);
+    }
+
+    #[test]
+    fn migratable_requires_a_verified_single_scope_under_keyspace_routing() {
+        use super::migratable;
+        let unverified = backend("a:1", KeyspaceScope::Unverified("ksb".into()));
+        let single = backend("b:1", KeyspaceScope::Single("ksb".into()));
+        let shared = backend("c:1", set(&["ksb"]));
+        assert!(!migratable(&unverified, true));
+        assert!(migratable(&unverified, false), "legacy keeps Go's view");
+        assert!(migratable(&single, true) && migratable(&single, false));
+        assert!(!migratable(&shared, true) && !migratable(&shared, false));
     }
 
     #[test]

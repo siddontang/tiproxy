@@ -693,6 +693,182 @@ async fn session_admitted_on_shared_backend_stays_ineligible_after_record_flip()
     Ok(())
 }
 
+/// Waits for the simulation router to capture a candidate matching `ready`.
+async fn sim_until(sim: &MigrationSimulation, ready: impl Fn(&Candidate) -> bool) -> Candidate {
+    must(
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(candidate) = sim.router().capture()
+                    && ready(&candidate)
+                {
+                    break candidate;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await,
+    )
+}
+
+fn scope_of(candidate: &Candidate, id: &str) -> Option<control_topology::KeyspaceScope> {
+    candidate
+        .routing
+        .backends
+        .backends
+        .iter()
+        .find(|backend| backend.backend_id.as_ref() == id)
+        .map(|backend| backend.backend.serves.clone())
+}
+
+fn keyspace_record(ks: &str, addr: &str, suffix: &str) -> (String, Vec<u8>) {
+    let value = if suffix == "info" {
+        must(serde_json::to_vec(&classic()))
+    } else {
+        b"1".to_vec()
+    };
+    (
+        format!("/keyspaces/tidb/{ks}/topology/tidb/{addr}/{suffix}"),
+        value,
+    )
+}
+
+fn active_count(sim: &MigrationSimulation, id: &str) -> u64 {
+    sim.router().accounting(id).unwrap_or_default().active()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unverified_record_is_never_a_redirect_source_or_target() -> TestResult {
+    const VERIFIED_B: &str = "default/127.0.0.1:4003";
+    const UNVERIFIED_B: &str = "default/127.0.0.1:4000";
+    let (h, _) = harness_with(&[(PROCESS, "127.0.0.1:4002", classic())], 1, true).await?;
+    // 4003 is a verified ksb backend; 4000 carries ksb's stale info and only
+    // ksa's ttl, so the legacy fallback keeps it as Unverified(ksb).
+    h.fixture.raw_records(&[
+        keyspace_record("ksb", "127.0.0.1:4003", "info"),
+        keyspace_record("ksb", "127.0.0.1:4003", "ttl"),
+        keyspace_record("ksb", "127.0.0.1:4000", "info"),
+        keyspace_record("ksa", "127.0.0.1:4000", "ttl"),
+    ]);
+    let sim = simulation(&h);
+    let c = sim_until(&sim, |c| c.routing.backends.backends.len() == 2).await;
+    assert_eq!(
+        scope_of(&c, UNVERIFIED_B),
+        Some(control_topology::KeyspaceScope::Unverified(
+            "ksb".to_owned()
+        ))
+    );
+    let on_verified = active_on(&sim, &c, VERIFIED_B, &[UNVERIFIED_B]);
+    let on_unverified = active_on(&sim, &c, UNVERIFIED_B, &[VERIFIED_B]);
+
+    // Direct, in both directions.
+    assert!(matches!(
+        sim.prepare(&on_verified, &c, UNVERIFIED_B),
+        Err(RouteError::CrossKeyspace)
+    ));
+    assert!(matches!(
+        sim.prepare(&on_unverified, &c, VERIFIED_B),
+        Err(RouteError::CrossKeyspace)
+    ));
+    // Balance / failover-driven, draining either side.
+    let (_stop_tx, stop) = watch::channel(false);
+    for (revision, drained) in [(3, "127.0.0.1:4003"), (4, "127.0.0.1:4000")] {
+        let before = must(sim.router().capture());
+        h.patch(
+            &format!("[proxy]\nfail-backend-list=[\"{drained}\"]"),
+            revision,
+        );
+        h.source.deliver();
+        h.applied().await;
+        let drained = sim_until(&sim, |c| !Arc::ptr_eq(&c.config, &before.config)).await;
+        assert!(matches!(
+            sim.prepare_balance(&drained, ClientInfo::default(), ""),
+            Err(RouteError::CrossKeyspace)
+        ));
+        let now = Instant::now();
+        must(sim.round_at(&drained, true, &stop, now, now, 1));
+        assert!(sim.take_redirect().is_none(), "no balance redirect");
+    }
+    // Reconnect-to-self: only the verified session may reconnect, and only
+    // to its own verified backend; the unverified one gets no offer.
+    let queue = crate::scheduler::CommandQueue::new(8);
+    let summary = sim.router().redirect_all_to_self(&queue, Instant::now());
+    assert_eq!((summary.offered, summary.accepted), (2, 1));
+    let redirect = queue.take_redirect().ok_or("verified self-redirect")?;
+    assert_eq!(redirect.to().backend_id, VERIFIED_B);
+    assert!(queue.take_redirect().is_none());
+    assert_eq!(sim.finish(&redirect, true), Settlement::Applied);
+    // Both sessions keep serving where they were.
+    assert_eq!(active_count(&sim, VERIFIED_B), 1);
+    assert_eq!(active_count(&sim, UNVERIFIED_B), 1);
+    sim.router().close(&on_verified);
+    sim.router().close(&on_unverified);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn session_is_not_redirected_after_its_address_changes_tenant() -> TestResult {
+    const FLIPPED: &str = "default/127.0.0.1:4003";
+    const OTHER_A: &str = "default/127.0.0.1:4002";
+    let (h, _) = harness_with(&[(PROCESS, "127.0.0.1:4002", classic())], 1, true).await?;
+    h.fixture.raw_records(&[
+        keyspace_record("ksb", "127.0.0.1:4003", "info"),
+        keyspace_record("ksb", "127.0.0.1:4003", "ttl"),
+        keyspace_record("ksa", "127.0.0.1:4002", "info"),
+        keyspace_record("ksa", "127.0.0.1:4002", "ttl"),
+    ]);
+    let sim = simulation(&h);
+    let c = sim_until(&sim, |c| {
+        scope_of(c, FLIPPED) == Some(control_topology::KeyspaceScope::Single("ksb".to_owned()))
+    })
+    .await;
+    let session = active_on(&sim, &c, FLIPPED, &[OTHER_A]);
+
+    // The address is re-registered as a verified ksa backend while the ksb
+    // session stays open, and is drained so balance proposes moving it to
+    // the other ksa backend.
+    h.fixture.raw_records(&[
+        keyspace_record("ksa", "127.0.0.1:4003", "info"),
+        keyspace_record("ksa", "127.0.0.1:4003", "ttl"),
+        keyspace_record("ksa", "127.0.0.1:4002", "info"),
+        keyspace_record("ksa", "127.0.0.1:4002", "ttl"),
+    ]);
+    h.patch("[proxy]\nfail-backend-list=[\"127.0.0.1:4003\"]", 3);
+    h.source.deliver();
+    h.applied().await;
+    let flipped = sim_until(&sim, |candidate| {
+        !Arc::ptr_eq(&candidate.config, &c.config)
+            && scope_of(candidate, FLIPPED)
+                == Some(control_topology::KeyspaceScope::Single("ksa".to_owned()))
+    })
+    .await;
+
+    // Direct.
+    assert!(matches!(
+        sim.prepare(&session, &flipped, OTHER_A),
+        Err(RouteError::CrossKeyspace)
+    ));
+    // Balance / failover-driven: the ksa pair is planned, the offer refused.
+    let plan = must(sim.prepare_balance(&flipped, ClientInfo::default(), ""))
+        .ok_or("drain pair is planned")?;
+    assert_eq!(plan.redirects().len(), 1);
+    assert!(!must(sim.offer(&plan.redirects()[0])), "offer refused");
+    assert!(sim.take_redirect().is_none());
+    let (_stop_tx, stop) = watch::channel(false);
+    let now = Instant::now();
+    must(sim.round_at(&flipped, true, &stop, now, now, 1));
+    assert!(sim.take_redirect().is_none(), "no balance redirect");
+    // Reconnect-to-self onto the reused (now ksa) address.
+    let queue = crate::scheduler::CommandQueue::new(8);
+    let summary = sim.router().redirect_all_to_self(&queue, Instant::now());
+    assert_eq!((summary.offered, summary.accepted), (1, 0));
+    assert!(queue.take_redirect().is_none());
+    // The session keeps serving on its original account.
+    assert_eq!(active_count(&sim, FLIPPED), 1);
+    assert_eq!(active_count(&sim, OTHER_A), 0);
+    sim.router().close(&session);
+    Ok(())
+}
+
 #[test]
 fn shared_backend_assignment_has_no_single_keyspace() {
     // A shared backend never borrows an operator `keyspace` label as its
