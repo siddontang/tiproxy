@@ -16,42 +16,12 @@
 //!
 //! A client selects a tenant with a `<keyspace>.<user>` name, the same prefix
 //! a multi-keyspace `TiDB` node routes by. Namespace resolution is unchanged;
-//! the keyspace only narrows the backend candidates of the resolved namespace.
-
-use std::sync::atomic::{AtomicBool, Ordering};
+//! the namespace's `keyspace-routing` setting decides whether the keyspace
+//! narrows the backend candidates of the resolved namespace.
 
 use control_topology::MergedBackend;
 
 use crate::RouteError;
-
-/// Per-namespace, process-lifetime memory that the namespace has had a shared
-/// (multi-keyspace) backend.
-///
-/// The memory is sticky: once set it is never cleared, and the route plane
-/// hands the same instance to every router incarnation of a namespace name.
-/// Without it, the lease expiry of every shared backend in a mixed namespace
-/// would switch the keyspace filter off and let a `<keyspace>.<user>` client
-/// land on another tenant's single-keyspace backend.
-#[derive(Debug, Default)]
-pub(crate) struct KeyspaceMemory {
-    seen_shared: AtomicBool,
-}
-
-impl KeyspaceMemory {
-    /// Records any shared backend in `backends`; returns whether a shared
-    /// backend is present now or has been observed before.
-    pub(crate) fn observe(&self, backends: &[MergedBackend]) -> bool {
-        if backends
-            .iter()
-            .any(|backend| backend.backend.serves.is_shared())
-        {
-            // A monotonic flag guards no other data, so relaxed is enough.
-            self.seen_shared.store(true, Ordering::Relaxed);
-            return true;
-        }
-        self.seen_shared.load(Ordering::Relaxed)
-    }
-}
 
 /// The keyspace a client selected with its user name: the nonempty prefix
 /// before the first `.`, or `None` when the name has no such prefix.
@@ -62,51 +32,61 @@ pub fn user_keyspace(user: &str) -> Option<&str> {
         .filter(|prefix| !prefix.is_empty())
 }
 
-/// Resolves the keyspace filter for one admission against a namespace's
-/// discovered backends (health-independent).
+/// The backend candidate rule for one admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyspaceFilter<'a> {
+    /// `keyspace-routing = false`: today's routing over every backend except
+    /// shared ones, which can neither be selected nor attribute a legacy
+    /// login to a keyspace.
+    Legacy,
+    /// `keyspace-routing = true` and no user-name prefix: every backend.
+    Unprefixed,
+    /// `keyspace-routing = true` and a `<keyspace>.<user>` login: only the
+    /// backends serving that keyspace.
+    Keyspace(&'a str),
+}
+
+/// Resolves the candidate rule for one admission from the namespace's
+/// explicit `keyspace-routing` setting and the client's user-name prefix.
 ///
-/// The filter is active only when the client named a keyspace **and** the
-/// namespace has a multi-keyspace backend now **or has had one since this
-/// process started** (sticky [`KeyspaceMemory`]; it observes every routing
-/// snapshot the router's worker, admission check and reserve see). A
-/// namespace that never had a shared backend — classic or single-keyspace,
-/// whose user-name prefix need not be the keyspace name — keeps today's
-/// routing exactly, including for user names that merely contain a dot. A
-/// shared backend that appears and expires between two observed snapshots
-/// is not remembered. When active, at least one
-/// discovered backend must serve the keyspace (`Single` equal, `Set`
-/// containing it, or `Any`); otherwise the connection is refused with
-/// [`RouteError::KeyspaceNotServed`] rather than falling back.
+/// The decision never depends on what discovery currently shows, so it is
+/// stable across restarts and lease expiry: with `keyspace-routing = true` a
+/// prefixed login is always filtered, and it is refused with
+/// [`RouteError::KeyspaceNotServed`] when no discovered backend (regardless
+/// of health) serves its keyspace (`Single` equal, `Set` containing it, or
+/// `Any`). There is no fallback to a non-serving backend.
 ///
 /// # Errors
 ///
-/// [`RouteError::KeyspaceNotServed`] when the filter is active and no
-/// discovered backend serves the keyspace.
+/// [`RouteError::KeyspaceNotServed`] as described above.
 pub(crate) fn admission_filter<'a>(
     backends: &[MergedBackend],
+    keyspace_routing: bool,
     keyspace: Option<&'a str>,
-    memory: &KeyspaceMemory,
-) -> Result<Option<&'a str>, RouteError> {
-    let had_shared = memory.observe(backends);
-    let Some(keyspace) = keyspace else {
-        return Ok(None);
-    };
-    if !had_shared {
-        return Ok(None);
+) -> Result<KeyspaceFilter<'a>, RouteError> {
+    if !keyspace_routing {
+        return Ok(KeyspaceFilter::Legacy);
     }
+    let Some(keyspace) = keyspace else {
+        return Ok(KeyspaceFilter::Unprefixed);
+    };
     if backends
         .iter()
         .any(|backend| backend.backend.serves.serves(keyspace))
     {
-        Ok(Some(keyspace))
+        Ok(KeyspaceFilter::Keyspace(keyspace))
     } else {
         Err(RouteError::KeyspaceNotServed)
     }
 }
 
 /// Whether `backend` is a candidate under an (already resolved) filter.
-pub(crate) fn admits(backend: &MergedBackend, filter: Option<&str>) -> bool {
-    filter.is_none_or(|keyspace| backend.backend.serves.serves(keyspace))
+pub(crate) fn admits(backend: &MergedBackend, filter: KeyspaceFilter<'_>) -> bool {
+    match filter {
+        KeyspaceFilter::Legacy => !backend.backend.serves.is_shared(),
+        KeyspaceFilter::Unprefixed => true,
+        KeyspaceFilter::Keyspace(keyspace) => backend.backend.serves.serves(keyspace),
+    }
 }
 
 #[cfg(test)]
@@ -116,7 +96,7 @@ mod tests {
 
     use control_topology::{BackendInfo, KeyspaceScope, MergedBackend};
 
-    use super::{KeyspaceMemory, RouteError, admission_filter, admits, user_keyspace};
+    use super::{KeyspaceFilter, RouteError, admission_filter, admits, user_keyspace};
 
     fn backend(addr: &str, serves: KeyspaceScope) -> MergedBackend {
         MergedBackend {
@@ -145,6 +125,23 @@ mod tests {
         )
     }
 
+    fn admitted<'a>(backends: &'a [MergedBackend], filter: KeyspaceFilter<'_>) -> Vec<&'a str> {
+        backends
+            .iter()
+            .filter(|backend| admits(backend, filter))
+            .map(|backend| backend.backend.addr.as_str())
+            .collect()
+    }
+
+    fn mixed() -> [MergedBackend; 4] {
+        [
+            backend("a:1", set(&["ks1", "ks2"])),
+            backend("b:1", KeyspaceScope::Any),
+            backend("c:1", KeyspaceScope::Single("ks1".into())),
+            backend("d:1", KeyspaceScope::default()),
+        ]
+    }
+
     #[test]
     fn user_prefix_is_split_at_the_first_dot() {
         assert_eq!(user_keyspace("keyspace1.app"), Some("keyspace1"));
@@ -156,102 +153,58 @@ mod tests {
     }
 
     #[test]
-    fn shared_backend_memory_is_sticky() {
-        let memory = KeyspaceMemory::default();
-        let single = [
-            backend("a:1", KeyspaceScope::default()),
-            backend("b:1", KeyspaceScope::Single("ks2".into())),
-        ];
-        // Never shared: today's routing, even for an unserved prefix.
-        assert_eq!(admission_filter(&single, Some("ks1"), &memory), Ok(None));
-        // A shared backend is observed (by a no-prefix admission too).
-        let mixed = [
-            backend("a:1", KeyspaceScope::default()),
-            backend("b:1", KeyspaceScope::Single("ks2".into())),
-            backend("c:1", set(&["ks1"])),
-        ];
-        assert_eq!(admission_filter(&mixed, None, &memory), Ok(None));
-        // It expires; the filter stays active on the remaining backends.
-        assert_eq!(
-            admission_filter(&single, Some("ks1"), &memory),
-            Err(RouteError::KeyspaceNotServed)
-        );
-        assert_eq!(
-            admission_filter(&single, Some("ks2"), &memory),
-            Ok(Some("ks2"))
-        );
-        assert!(!admits(&single[0], Some("ks2")));
-        assert_eq!(admission_filter(&single, None, &memory), Ok(None));
+    fn legacy_namespace_ignores_the_prefix_and_never_selects_shared() {
+        let backends = mixed();
+        for keyspace in [None, Some("ks1"), Some("ks9")] {
+            let filter = admission_filter(&backends, false, keyspace);
+            assert_eq!(filter, Ok(KeyspaceFilter::Legacy));
+            assert_eq!(admitted(&backends, KeyspaceFilter::Legacy), ["c:1", "d:1"]);
+        }
     }
 
     #[test]
-    fn no_prefix_or_no_shared_backend_keeps_todays_routing() {
-        let classic = [
-            backend("a:1", KeyspaceScope::default()),
-            backend("b:1", KeyspaceScope::Single("ks2".into())),
-        ];
+    fn keyspace_routing_filters_a_prefixed_login() {
+        let backends = mixed();
+        let filter = admission_filter(&backends, true, Some("ks1"));
+        assert_eq!(filter, Ok(KeyspaceFilter::Keyspace("ks1")));
         assert_eq!(
-            admission_filter(&classic, None, &KeyspaceMemory::default()),
-            Ok(None)
+            admitted(&backends, KeyspaceFilter::Keyspace("ks1")),
+            ["a:1", "b:1", "c:1"]
         );
-        // A dotted user on single-keyspace backends is not filtered.
+        // Any serves a cold keyspace nobody lists.
         assert_eq!(
-            admission_filter(&classic, Some("ks1"), &KeyspaceMemory::default()),
-            Ok(None)
+            admitted(&backends, KeyspaceFilter::Keyspace("cold")),
+            ["b:1"]
         );
-        let shared = [backend("a:1", set(&["ks1"]))];
-        assert_eq!(
-            admission_filter(&shared, None, &KeyspaceMemory::default()),
-            Ok(None)
-        );
-        assert!(admits(&shared[0], None));
     }
 
     #[test]
-    fn served_keyspace_filters_candidates() {
-        let backends = [
-            backend("a:1", set(&["ks1", "ks2"])),
-            backend("b:1", set(&["ks3"])),
+    fn keyspace_routing_without_prefix_keeps_every_backend() {
+        let backends = mixed();
+        assert_eq!(
+            admission_filter(&backends, true, None),
+            Ok(KeyspaceFilter::Unprefixed)
+        );
+        assert_eq!(admitted(&backends, KeyspaceFilter::Unprefixed).len(), 4);
+    }
+
+    #[test]
+    fn keyspace_routing_refuses_an_unserved_keyspace_whatever_discovery_shows() {
+        let without_shared = [
             backend("c:1", KeyspaceScope::Single("ks1".into())),
             backend("d:1", KeyspaceScope::default()),
         ];
-        let filter = admission_filter(&backends, Some("ks1"), &KeyspaceMemory::default());
-        assert_eq!(filter, Ok(Some("ks1")));
-        let admitted: Vec<_> = backends
-            .iter()
-            .filter(|backend| admits(backend, Some("ks1")))
-            .map(|backend| backend.backend.addr.as_str())
-            .collect();
-        assert_eq!(admitted, ["a:1", "c:1"]);
-    }
-
-    #[test]
-    fn any_serves_every_keyspace() {
-        let backends = [
-            backend("a:1", KeyspaceScope::Any),
-            backend("b:1", set(&["ks1"])),
-        ];
         assert_eq!(
-            admission_filter(&backends, Some("cold"), &KeyspaceMemory::default()),
-            Ok(Some("cold"))
+            admission_filter(&without_shared, true, Some("ks9")),
+            Err(RouteError::KeyspaceNotServed)
         );
-        assert!(admits(&backends[0], Some("cold")));
-        assert!(!admits(&backends[1], Some("cold")));
-    }
-
-    #[test]
-    fn unserved_keyspace_is_refused() {
-        let backends = [
-            backend("a:1", set(&["ks1"])),
-            backend("b:1", KeyspaceScope::default()),
-        ];
         assert_eq!(
-            admission_filter(&backends, Some("ks9"), &KeyspaceMemory::default()),
+            admission_filter(&[], true, Some("ks1")),
             Err(RouteError::KeyspaceNotServed)
         );
         let empty = [backend("a:1", KeyspaceScope::Set(BTreeSet::new()))];
         assert_eq!(
-            admission_filter(&empty, Some("ks1"), &KeyspaceMemory::default()),
+            admission_filter(&empty, true, Some("ks1")),
             Err(RouteError::KeyspaceNotServed)
         );
     }

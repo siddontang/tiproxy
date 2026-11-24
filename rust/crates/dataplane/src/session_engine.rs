@@ -549,17 +549,29 @@ enum SessionRouteChannel {
     Bridge(BindingRouteChannel),
 }
 
+/// `ER_ACCESS_DENIED_ERROR` for a `<keyspace>.<user>` prefix naming a keyspace
+/// that no backend of the resolved namespace serves. One vocabulary for both
+/// the admission refusal and the admission-to-route race.
+const KEYSPACE_NOT_SERVED_CLIENT_ERROR: (u16, [u8; 5], &str) = (
+    1045,
+    *b"28000",
+    "Access denied: the keyspace in the user name is not served by any TiDB instance",
+);
+
 const fn local_admission_client_error(error: RouteError) -> Option<(u16, [u8; 5], &'static str)> {
     match error {
         RouteError::NamespaceMissing => Some((1105, *b"HY000", "failed to find a namespace")),
         RouteError::InvalidConfig => Some((1105, *b"HY000", "invalid namespace configuration")),
-        // ER_ACCESS_DENIED_ERROR: the `<keyspace>.<user>` prefix names a
-        // keyspace that no backend of the resolved namespace serves.
-        RouteError::KeyspaceNotServed => Some((
-            1045,
-            *b"28000",
-            "Access denied: the keyspace in the user name is not served by any TiDB instance",
-        )),
+        RouteError::KeyspaceNotServed => Some(KEYSPACE_NOT_SERVED_CLIENT_ERROR),
+        _ => None,
+    }
+}
+
+/// The client ERR packet fields for an acquisition failure that is answered
+/// with a fixed error rather than the shared handshake-failure vocabulary.
+const fn acquire_client_error(error: &AcquireError) -> Option<(u16, [u8; 5], &'static str)> {
+    match error {
+        AcquireError::KeyspaceNotServed { .. } => Some(KEYSPACE_NOT_SERVED_CLIENT_ERROR),
         _ => None,
     }
 }
@@ -2168,6 +2180,11 @@ impl Engine {
                         self.quit_source = QuitSource::BackendHandshake;
                         self.write_handshake_failure(FailureKind::BackendHandshake, false)
                             .await;
+                    }
+                    AcquireError::KeyspaceNotServed { .. } => {
+                        if let Some((code, state, message)) = acquire_client_error(&error) {
+                            self.write_handshake_error(code, state, message).await;
+                        }
                     }
                     AcquireError::BudgetExhausted { last_failure: None }
                     | AcquireError::Routing { .. }
@@ -5204,6 +5221,12 @@ impl Engine {
                 (response.code(), response.sql_state(), response.message())
             }
         };
+        self.write_handshake_error(code, state, message).await;
+    }
+
+    /// Writes one handshake-phase ERR packet in reply to the client's
+    /// handshake response, with the `CLIENT_PROTOCOL_41` SQLSTATE form.
+    async fn write_handshake_error(&mut self, code: u16, state: [u8; 5], message: &str) {
         let seq = self.client_io.expected_read_sequence();
         self.client_io.reset_write_sequence(seq);
         let capabilities = self.negotiated.union(CapabilityFlags::PROTOCOL_41);
@@ -5394,6 +5417,8 @@ const fn acquire_quit_source(error: &AcquireError) -> QuitSource {
         AcquireError::BudgetExhausted {
             last_failure: Some(_),
         } => QuitSource::BackendHandshake,
+        // The client's own user name selected an unserved keyspace.
+        AcquireError::KeyspaceNotServed { .. } => QuitSource::ClientAuthFail,
         AcquireError::BudgetExhausted { last_failure: None }
         | AcquireError::Routing { .. }
         | AcquireError::MalformedAssignment { .. }
@@ -5861,6 +5886,7 @@ mod error_classification_tests {
 #[cfg(test)]
 mod tls_wiring_tests {
     use super::{
+        AcquireError, QuitSource, acquire_client_error, acquire_quit_source,
         backend_health_in_snapshot, backend_server_name, candidate_budget, leading_capabilities,
         local_admission_client_error, migration_auth_capabilities, normalize_leading_capabilities,
         proxy_capabilities, proxy_client_log_address, record_proxy_client_log_source,
@@ -5918,6 +5944,46 @@ mod tls_wiring_tests {
         };
         assert_eq!((code, state), (1045, *b"28000"));
         assert!(message.starts_with("Access denied"));
+    }
+
+    /// The admission-to-route race (the last serving backend leaves after
+    /// admission) reaches the client as the very same 1045/28000 ERR packet
+    /// as the admission refusal, never the no-backend vocabulary.
+    #[test]
+    fn keyspace_not_served_race_writes_the_access_denied_err_packet() {
+        let race = AcquireError::KeyspaceNotServed {
+            detail: "No TiDB instance serves the keyspace selected by the user name".to_owned(),
+        };
+        let Some((code, state, message)) = acquire_client_error(&race) else {
+            unreachable!("the race is a client-visible refusal")
+        };
+        assert_eq!(
+            Some((code, state, message)),
+            local_admission_client_error(RouteError::KeyspaceNotServed)
+        );
+        assert_eq!(acquire_quit_source(&race), QuitSource::ClientAuthFail);
+        assert_eq!(
+            acquire_client_error(&AcquireError::NoBackend {
+                detail: String::new()
+            }),
+            None,
+            "a plain no-backend keeps the shared handshake-failure vocabulary"
+        );
+
+        // Exactly what `write_handshake_error` puts on the wire.
+        let Ok(packet) = mysql_wire::encode_error_packet(
+            code,
+            Some(state),
+            message.as_bytes(),
+            CapabilityFlags::PROTOCOL_41,
+        ) else {
+            unreachable!("ERR packet encodes")
+        };
+        assert_eq!(packet.first(), Some(&0xFF));
+        assert_eq!(u16::from_le_bytes([packet[1], packet[2]]), 1045);
+        assert_eq!(packet[3], b'#');
+        assert_eq!(&packet[4..9], b"28000");
+        assert_eq!(&packet[9..], message.as_bytes());
     }
 
     #[test]

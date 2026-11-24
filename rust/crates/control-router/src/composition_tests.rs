@@ -102,7 +102,12 @@ fn shared_go_composition_observation() {
             let policy = must(store.current().effective().routing());
             let excluded: Vec<&str> = array(&row["excluded"]).iter().map(string).collect();
             let ids: Vec<&str> = state
-                .routeable(number(&row["group"]), &policy, &excluded, None)
+                .routeable(
+                    number(&row["group"]),
+                    &policy,
+                    &excluded,
+                    crate::keyspace::KeyspaceFilter::Legacy,
+                )
                 .iter()
                 .map(|(backend, _)| backend.source.backend_id.as_ref())
                 .collect();

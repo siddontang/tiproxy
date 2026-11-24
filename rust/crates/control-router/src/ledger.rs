@@ -178,6 +178,9 @@ pub struct Reservation {
     sequence: u64,
     account: Arc<AccountIdentity>,
     assignment: RouteAssignment,
+    /// Whether the selected backend was shared (multi-keyspace) when this
+    /// attempt was reserved; carried to the active session until close.
+    shared: bool,
 }
 
 impl Reservation {
@@ -284,6 +287,9 @@ impl ForceClose {
 struct Active {
     account: Arc<AccountIdentity>,
     assignment: RouteAssignment,
+    /// Admitted on a shared backend. Recorded once and never re-read from
+    /// discovery, because the account outlives a changed address record.
+    shared: bool,
     redirect: Option<Redirect>,
     failed_at: Option<Instant>,
     closing: Option<ForceClose>,
@@ -635,11 +641,23 @@ impl Ledger {
             .ok_or(LedgerError::ClosedSession)
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve(
         &mut self,
         session: &Session,
         identity: &Arc<AccountIdentity>,
+        assignment: RouteAssignment,
+    ) -> Result<Reservation, LedgerError> {
+        self.reserve_scoped(session, identity, assignment, false)
+    }
+
+    /// [`Self::reserve`] recording whether the backend is shared.
+    pub(crate) fn reserve_scoped(
+        &mut self,
+        session: &Session,
+        identity: &Arc<AccountIdentity>,
         mut assignment: RouteAssignment,
+        shared: bool,
     ) -> Result<Reservation, LedgerError> {
         if let Some(reservation) = self.pending(session)? {
             return Ok(reservation);
@@ -661,6 +679,7 @@ impl Ledger {
             sequence: self.next_reservation,
             account: Arc::clone(identity),
             assignment,
+            shared,
         };
         // All fallible checks precede the first counter or state change.
         self.next_reservation = next;
@@ -700,6 +719,7 @@ impl Ledger {
             Stage::Active(Box::new(Active {
                 account: Arc::clone(&reservation.account),
                 assignment: reservation.assignment.clone(),
+                shared: reservation.shared,
                 redirect: None,
                 closing: None,
                 failed_at: None,
@@ -722,6 +742,11 @@ impl Ledger {
                 sequence,
             })
             .collect()
+    }
+
+    /// Whether this active session was admitted on a shared backend.
+    pub(crate) fn admitted_shared(&self, session: &Session) -> bool {
+        matches!(self.stage(session), Ok(Stage::Active(active)) if active.shared)
     }
 
     pub(crate) fn active_owner(

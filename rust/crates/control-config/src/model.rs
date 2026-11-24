@@ -497,6 +497,9 @@ pub struct RoutingNamespace {
     pub backend_instances: Arc<[Arc<str>]>,
     /// Namespace-specific backend client TLS material and policy.
     pub backend_tls: ClientTlsConfig,
+    /// Whether `<keyspace>.<user>` logins are routed by keyspace prefix; see
+    /// [`NamespaceConfig::keyspace_routing`].
+    pub keyspace_routing: bool,
 }
 
 /// SQL serving configuration owned by CP-CFG. Protocol-only handshake facts
@@ -599,6 +602,16 @@ pub struct NamespaceConfig {
     pub frontend: FrontendNamespaceConfig,
     /// Static backend instances and TLS policy.
     pub backend: BackendNamespaceConfig,
+    /// Rust-only extension (Go `config.Namespace` has no such field and
+    /// ignores it): route `<keyspace>.<user>` logins by keyspace prefix.
+    ///
+    /// `false` (default) is the legacy mode: routing is unchanged and
+    /// multi-keyspace (shared) backends are never selected. `true` filters a
+    /// prefixed login to the backends serving its keyspace and refuses it
+    /// when none does. Omitted from the canonical JSON when `false`, so a
+    /// legacy namespace keeps its Go-identical encoding and checksum.
+    #[serde(rename = "keyspace-routing", skip_serializing_if = "is_false")]
+    pub keyspace_routing: bool,
 }
 
 /// Frontend namespace identity and TLS policy.
@@ -1391,6 +1404,7 @@ impl NamespaceConfig {
                     .collect::<Vec<_>>(),
             ),
             backend_tls: client_tls(&self.backend.security),
+            keyspace_routing: self.keyspace_routing,
         }
     }
 

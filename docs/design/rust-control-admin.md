@@ -173,6 +173,9 @@ drain traffic on the bridge.
   decode (tiproxyctl, TiDB Dashboard) see the same configuration.
 - The bare `/api/admin/namespace` and `/api/admin/config` paths are served
   directly instead of gin's `301` to the slash form.
+- A namespace body's Rust-only `keyspace-routing` member is decoded and
+  persisted; Go ignores it as an unknown member. It is omitted while `false`,
+  so bodies without it are unchanged.
 
 ### Declared divergences after slice 1
 

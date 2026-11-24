@@ -959,3 +959,29 @@ async fn total_budget_bounds_request_and_report_sends() {
     );
     assert_eq!(report_engine.stats().results_reported, 0);
 }
+
+/// The admission-to-route race: the last backend serving the client's
+/// keyspace leaves after admission. The typed terminal survives acquisition
+/// as its own error (the client is refused with access denied), never the
+/// generic `NO_BACKEND`.
+#[tokio::test(start_paused = true)]
+async fn keyspace_not_served_terminal_stays_typed() {
+    let mut adapter = FakeAdapter::default();
+    adapter.assignments.push_back(terminal(
+        RouteCode::KeyspaceNotServed,
+        "No TiDB instance serves the keyspace selected by the user name",
+    ));
+    let dialer = FakeDialer::new(&[]);
+    let mut engine = engine(adapter, dialer, schedule());
+    let Err(error) = engine.acquire(Vec::new()).await else {
+        unreachable!("an unserved keyspace must not connect")
+    };
+    assert_eq!(
+        error,
+        AcquireError::KeyspaceNotServed {
+            detail: "No TiDB instance serves the keyspace selected by the user name".to_owned()
+        }
+    );
+    let (channel, _) = engine.into_parts();
+    assert!(channel.results.is_empty(), "the terminal needs no result");
+}

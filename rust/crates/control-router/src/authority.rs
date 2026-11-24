@@ -289,6 +289,18 @@ impl Sources {
         )
     }
 
+    /// The bound namespace's explicit `keyspace-routing` setting. It is part
+    /// of the namespace routing projection, so flipping it replaces the router
+    /// incarnation instead of changing a live one.
+    pub(crate) const fn keyspace_routing(&self) -> bool {
+        self.namespace.keyspace_routing
+    }
+
+    /// The bound namespace name, for diagnostics.
+    pub(crate) fn namespace_name(&self) -> &str {
+        &self.namespace.name
+    }
+
     pub(crate) fn admit(&self) -> Result<Arc<ConfigNamespaceSnapshot>, RouteError> {
         self.live()?;
         let config = self.source.current();

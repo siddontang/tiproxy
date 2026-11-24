@@ -214,9 +214,9 @@ pub struct Router {
     /// Where settled migration observations are published. Installed by the
     /// composition owner; absent in tests and in any build with no exporter.
     migrations: Mutex<Option<Arc<dyn MigrationSink>>>,
-    /// Sticky per-namespace memory of shared backends, shared by every
-    /// incarnation the route plane builds for this namespace name.
-    keyspace_memory: Arc<crate::keyspace::KeyspaceMemory>,
+    /// Shared backends already reported in a legacy (`keyspace-routing =
+    /// false`) namespace, so each discovery is warned about once.
+    legacy_shared_warned: Mutex<BTreeSet<Arc<str>>>,
     state: Mutex<State>,
     #[cfg(test)]
     next_lock: Mutex<Option<std::sync::mpsc::Sender<()>>>,
@@ -259,8 +259,6 @@ pub struct RouterShared {
     pub scores: Arc<crate::ScoreHistory>,
     /// Retained `backend_metric` observations, also process-level.
     pub backend_metrics: Arc<crate::BackendMetricHistory>,
-    /// Sticky memory that this namespace has had a shared backend.
-    pub(crate) keyspace_memory: Arc<crate::keyspace::KeyspaceMemory>,
 }
 
 impl Router {
@@ -314,7 +312,7 @@ impl Router {
             factors_enabled: false,
             metrics: None,
             input_diagnostics: None,
-            keyspace_memory: Arc::default(),
+            legacy_shared_warned: Mutex::new(BTreeSet::new()),
             sources: Sources::new(source, topology, context, namespace)?,
             #[cfg(test)]
             next_lock: Mutex::new(None),
@@ -360,7 +358,7 @@ impl Router {
             factors_enabled: true,
             metrics,
             input_diagnostics: Some(shared.input_diagnostics),
-            keyspace_memory: shared.keyspace_memory,
+            legacy_shared_warned: Mutex::new(BTreeSet::new()),
             sources: Sources::new_retained(source, topology, context, resolved)?,
             #[cfg(test)]
             next_lock: Mutex::new(None),
@@ -596,9 +594,12 @@ impl Router {
         // restoration until valid routing labels have admitted this backend.
         backend.group.ok_or(RouteError::NoBackend)?;
         let account = Arc::clone(&backend.account);
+        let shared = backend.source.backend.serves.is_shared();
         let result = assignment(&backend.source, candidate.health.get(id).local);
         self.sources.validate(&candidate)?;
-        let reservation = state.ledger.reserve(session, &account, result)?;
+        let reservation = state
+            .ledger
+            .reserve_scoped(session, &account, result, shared)?;
         let result = reservation.assignment().clone();
         let settled = state.ledger.finish(&reservation, true);
         debug_assert_eq!(settled, Settlement::Applied);
@@ -649,7 +650,7 @@ impl Router {
 
     /// [`Self::reserve`] for a client that selected `keyspace` with its
     /// `<keyspace>.<user>` name. See [`crate::keyspace::admission_filter`]
-    /// for when the keyspace narrows the candidates.
+    /// for how the namespace's `keyspace-routing` setting uses it.
     pub(crate) fn reserve_in_keyspace(
         &self,
         session: &Session,
@@ -679,25 +680,55 @@ impl Router {
     /// requested. A capture failure defers every decision to reserve, which
     /// re-applies the same rule under its own lock.
     pub(crate) fn check_keyspace(&self, keyspace: Option<&str>) -> Result<(), RouteError> {
-        if keyspace.is_none() {
+        if keyspace.is_none() || !self.sources.keyspace_routing() {
             return Ok(());
         }
         let Ok(candidate) = self.capture_retained() else {
             return Ok(());
         };
-        crate::keyspace::admission_filter(
-            &candidate.routing.backends.backends,
-            keyspace,
-            &self.keyspace_memory,
-        )
-        .map(|_| ())
+        crate::keyspace::admission_filter(&candidate.routing.backends.backends, true, keyspace)
+            .map(|_| ())
     }
 
-    /// Records whether `candidate`'s topology has a shared backend, so the
-    /// sticky keyspace memory sees snapshots no client routed against.
-    pub(crate) fn observe_keyspaces(&self, candidate: &Candidate) {
-        self.keyspace_memory
-            .observe(&candidate.routing.backends.backends);
+    /// Warns once per shared (multi-keyspace) backend discovered in a legacy
+    /// namespace, where it is never selected. Returns the newly warned ids.
+    /// The memory follows the topology, so a backend that leaves and comes
+    /// back is reported again and the set stays bounded.
+    pub(crate) fn warn_legacy_shared(&self, candidate: &Candidate) -> Vec<Arc<str>> {
+        if self.sources.keyspace_routing() {
+            return Vec::new();
+        }
+        let shared: Vec<&MergedBackend> = candidate
+            .routing
+            .backends
+            .backends
+            .iter()
+            .filter(|backend| backend.backend.serves.is_shared())
+            .collect();
+        let mut warned = self
+            .legacy_shared_warned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        warned.retain(|id| shared.iter().any(|backend| backend.backend_id == *id));
+        let mut fresh = Vec::new();
+        for backend in shared {
+            if warned.insert(Arc::clone(&backend.backend_id)) {
+                let line = serde_json::json!({
+                    "component": "control-router",
+                    "event": "shared_backend_in_legacy_namespace",
+                    "namespace": self.sources.namespace_name(),
+                    "backend_id": backend.backend_id.as_ref(),
+                    "address": backend.backend.addr,
+                    "detail": "multi-keyspace backend is never selected while keyspace-routing is false",
+                });
+                control_plane::logging::emit(
+                    control_plane::logging::Level::Warn,
+                    &line.to_string(),
+                );
+                fresh.push(Arc::clone(&backend.backend_id));
+            }
+        }
+        fresh
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -723,8 +754,8 @@ impl Router {
         // falls back to a backend that does not serve the client's keyspace.
         let keyspace = crate::keyspace::admission_filter(
             &candidate.routing.backends.backends,
+            self.sources.keyspace_routing(),
             keyspace,
-            &self.keyspace_memory,
         )?;
         state.refresh(candidate)?;
         let group = state.factor_group(candidate, client, listener_port)?;
@@ -750,11 +781,12 @@ impl Router {
         let backend = choices[index].0;
         let identity = Arc::clone(&backend.account);
         let local = candidate.health.get(&backend.source.backend_id).local;
+        let shared = backend.source.backend.serves.is_shared();
         let assignment = assignment(&backend.source, local);
         self.sources.validate(candidate)?;
         state
             .ledger
-            .reserve(session, &identity, assignment)
+            .reserve_scoped(session, &identity, assignment, shared)
             .map_err(Into::into)
     }
 
@@ -766,7 +798,7 @@ impl Router {
         candidate: &Candidate,
         group: u64,
         excluded: &[&str],
-        keyspace: Option<&str>,
+        keyspace: crate::keyspace::KeyspaceFilter<'_>,
         ticket: u128,
     ) -> Result<Reservation, RouteError> {
         let metrics = match &candidate.metrics {
@@ -816,11 +848,14 @@ impl Router {
                 .ok_or(RouteError::NoBackend)?;
             let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
             let identity = Arc::clone(&backend.account);
+            let shared = backend.source.backend.serves.is_shared();
             let assignment = assignment(&backend.source, candidate.health.get(id).local);
             // Metrics qualify input data only. C/R/H and the ledger authorize
             // the effect, under this same lock and (when present) metric fence.
             self.sources.validate(candidate)?;
-            let reserved = state.ledger.reserve(session, &identity, assignment)?;
+            let reserved = state
+                .ledger
+                .reserve_scoped(session, &identity, assignment, shared)?;
             if metrics.is_some()
                 && let Some(diagnostics) = &self.input_diagnostics
             {
@@ -932,6 +967,11 @@ impl Router {
         self.sources.validate(candidate)?;
         state.refresh(candidate)?;
         let source = Arc::clone(state.ledger.active_owner(session)?);
+        // The admission-time fact, not the address's current scope: a record
+        // flipping from shared to single must not make this session movable.
+        if state.ledger.admitted_shared(session) {
+            return Err(RouteError::CrossKeyspace);
+        }
         let target = state.redirect_target(&source, candidate, target_id)?;
         self.sources.validate(candidate)?;
         Ok(crate::PreparedRedirect {
@@ -1013,18 +1053,23 @@ impl Router {
             return Err(RouteError::StaleCandidate);
         }
         state.refresh(&prepared.candidate)?;
-        let target =
-            match state.redirect_target(&prepared.source, &prepared.candidate, &prepared.target_id)
-            {
-                Ok(target) => target,
-                Err(RouteError::CrossKeyspace) => {
-                    self.sources.validate(&prepared.candidate)?;
-                    state.ledger.reject_keyspace(&prepared.session, now)?;
-                    state.record_keyspace_refusal(&prepared.source, &prepared.target_id, None, now);
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            };
+        // Every offer (direct, balance, failover-driven) funnels through here;
+        // a session admitted on a shared backend stays ineligible until close.
+        let target = if state.ledger.admitted_shared(&prepared.session) {
+            Err(RouteError::CrossKeyspace)
+        } else {
+            state.redirect_target(&prepared.source, &prepared.candidate, &prepared.target_id)
+        };
+        let target = match target {
+            Ok(target) => target,
+            Err(RouteError::CrossKeyspace) => {
+                self.sources.validate(&prepared.candidate)?;
+                state.ledger.reject_keyspace(&prepared.session, now)?;
+                state.record_keyspace_refusal(&prepared.source, &prepared.target_id, None, now);
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
         if !Arc::ptr_eq(&target.account, &prepared.target) {
             return Err(RouteError::StaleCandidate);
         }
@@ -1070,8 +1115,9 @@ impl Router {
             for session in state.ledger.redirectable_sessions() {
                 summary.offered += 1;
                 // Shared-backend migration stays disabled until it is
-                // qualified end to end; a refused offer is not an error.
-                if state.on_shared_backend(&session) {
+                // qualified end to end, by the session's admission-time fact
+                // and by the current scope; a refused offer is not an error.
+                if state.ledger.admitted_shared(&session) || state.on_shared_backend(&session) {
                     continue;
                 }
                 let Ok(redirect) = state.ledger.prepare_self_redirect(&session, now) else {
@@ -1270,7 +1316,13 @@ impl State {
             .ok_or(RouteError::StaleCandidate)?;
         let group = physical.group.ok_or(RouteError::NoBackend)?;
         let target = self
-            .routeable(group, &candidate.policy, &[], None)
+            // Shared targets are refused below whatever the namespace mode.
+            .routeable(
+                group,
+                &candidate.policy,
+                &[],
+                crate::keyspace::KeyspaceFilter::Unprefixed,
+            )
             .into_iter()
             .find(|(backend, _)| backend.source.backend_id.as_ref() == target_id)
             .map(|(backend, _)| backend)
@@ -1405,7 +1457,7 @@ impl State {
         group: u64,
         candidate: &Candidate,
         excluded: &[&str],
-        keyspace: Option<&str>,
+        keyspace: crate::keyspace::KeyspaceFilter<'_>,
     ) -> Vec<crate::factors::Input> {
         // The keyspace filter shrinks the candidate pool itself (before the
         // fail-list denominator), unlike retry exclusions below.
@@ -1442,7 +1494,7 @@ impl State {
         group: u64,
         policy: &RoutingConfig,
         excluded: &[&str],
-        keyspace: Option<&str>,
+        keyspace: crate::keyspace::KeyspaceFilter<'_>,
     ) -> Vec<(&Backend, u64)> {
         let mut choices: Vec<(&Backend, u64)> = self
             .backends

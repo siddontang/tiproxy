@@ -243,9 +243,11 @@ pub const TLS_SCHEMA: Schema = Schema::Object(&[
     ("skip-ca", Schema::Bool),
 ]);
 
-/// Go `config.Namespace`.
+/// Go `config.Namespace`, plus the Rust-only `keyspace-routing` member (Go
+/// ignores it as unknown; Rust decodes and persists it).
 pub const NAMESPACE_SCHEMA: Schema = Schema::Object(&[
     ("namespace", Schema::Str),
+    ("keyspace-routing", Schema::Bool),
     (
         "frontend",
         Schema::Object(&[("user", Schema::Str), ("security", TLS_SCHEMA)]),
@@ -480,6 +482,12 @@ mod tests {
             decode("{\"backend\":{\"instances\":[\"a\"],\"instances\":null}}").unwrap(),
             Some(serde_json::json!({"backend": {"instances": []}}))
         );
+        // The Rust-only namespace routing mode survives the admin decoder.
+        assert_eq!(
+            decode("{\"namespace\":\"a\",\"keyspace-routing\":true}").unwrap(),
+            Some(serde_json::json!({"namespace": "a", "keyspace-routing": true}))
+        );
+        assert!(decode("{\"keyspace-routing\":\"yes\"}").is_err());
         for bad in [
             "",
             "{",

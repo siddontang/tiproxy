@@ -122,6 +122,12 @@ pub enum AcquireError {
         /// Bounded adapter-provided detail.
         detail: String,
     },
+    /// The namespace routes by keyspace and no backend serves the keyspace
+    /// the client selected with its user name (terminal; access denied).
+    KeyspaceNotServed {
+        /// Bounded adapter-provided detail.
+        detail: String,
+    },
     /// The adapter answered a terminal non-OK assignment other than
     /// `NO_BACKEND` (internal routing failure).
     Routing {
@@ -503,6 +509,11 @@ impl<Ch: RouteChannel, D: BackendDialer, J: JitterSource> RouteEngine<Ch, D, J> 
                 RouteCode::Ok => {}
                 RouteCode::NoBackend => {
                     return Err(AcquireError::NoBackend {
+                        detail: assignment.detail,
+                    });
+                }
+                RouteCode::KeyspaceNotServed => {
+                    return Err(AcquireError::KeyspaceNotServed {
                         detail: assignment.detail,
                     });
                 }

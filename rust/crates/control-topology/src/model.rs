@@ -460,16 +460,20 @@ fn split_topology_key(key: &str) -> Option<(String, &str)> {
 /// Go's `map[string]*TiDBTopologyInfo` — a duplicate address across keyspaces
 /// resolves to the last-parsed record, as in Go.
 ///
-/// Address-collision rule for multi-keyspace nodes: when an address has a
-/// shared process record (unprefixed path, `"multi_keyspace": true`), that
-/// record wins over every per-keyspace record for the same address regardless
-/// of read order — its allow-list already describes every keyspace the node
-/// serves, while a per-keyspace record would narrow it to one. Without a shared
-/// record the historical last-parsed rule applies unchanged.
+/// Address-collision rule for multi-keyspace nodes: a shared process record
+/// (unprefixed path, `"multi_keyspace": true`) is live only with the `ttl`
+/// of its **own** unprefixed path; a per-keyspace `ttl` for the same address
+/// never keeps a stale shared allow-list alive. A live shared record wins
+/// over every per-keyspace record for the same address regardless of read
+/// order — its allow-list already describes every keyspace the node serves.
+/// Otherwise the historical rule applies unchanged to the single-keyspace
+/// records: the last-parsed one wins, live with any `ttl` for the address.
 #[must_use]
 pub fn parse_tidb_topology(entries: &[(Vec<u8>, Vec<u8>)]) -> TopologySnapshot {
     let mut infos: BTreeMap<String, BackendInfo> = BTreeMap::new();
+    let mut shared: BTreeMap<String, BackendInfo> = BTreeMap::new();
     let mut alive: BTreeSet<String> = BTreeSet::new();
+    let mut alive_process: BTreeSet<String> = BTreeSet::new();
     for (raw_key, raw_value) in entries {
         let Ok(key) = std::str::from_utf8(raw_key) else {
             continue;
@@ -485,13 +489,18 @@ pub fn parse_tidb_topology(entries: &[(Vec<u8>, Vec<u8>)]) -> TopologySnapshot {
         }
         match suffix {
             TTL_SUFFIX => {
+                if keyspace.is_empty() {
+                    alive_process.insert(addr.to_owned());
+                }
                 alive.insert(addr.to_owned());
             }
             INFO_SUFFIX => {
                 if let Some(info) = BackendInfo::from_info_json(addr, &keyspace, raw_value) {
-                    let keep_shared = !info.serves.is_shared()
-                        && infos.get(addr).is_some_and(|kept| kept.serves.is_shared());
-                    if !keep_shared {
+                    // Only an unprefixed record can be shared (see `scope`),
+                    // so the shared map is keyed by the process path.
+                    if info.serves.is_shared() {
+                        shared.insert(addr.to_owned(), info);
+                    } else {
                         infos.insert(addr.to_owned(), info);
                     }
                 }
@@ -499,10 +508,16 @@ pub fn parse_tidb_topology(entries: &[(Vec<u8>, Vec<u8>)]) -> TopologySnapshot {
             _ => {}
         }
     }
+    let shared_live: BTreeMap<String, BackendInfo> = shared
+        .into_iter()
+        .filter(|(addr, _)| alive_process.contains(addr))
+        .collect();
     let mut backends: Vec<BackendInfo> = infos
         .into_iter()
-        .filter_map(|(addr, info)| alive.contains(&addr).then_some(info))
+        .filter(|(addr, _)| !shared_live.contains_key(addr) && alive.contains(addr))
+        .map(|(_, info)| info)
         .collect();
+    backends.extend(shared_live.into_values());
     backends.sort_by(|left, right| left.addr.cmp(&right.addr));
     TopologySnapshot { backends }
 }
@@ -813,6 +828,47 @@ mod tests {
         let backward = only_backend(&[per_keyspace, shared, ttl]);
         assert_eq!(forward.serves, set(&["ks1", "ks2"]));
         assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn stale_shared_process_record_is_not_kept_alive_by_a_keyspace_ttl() {
+        // The process lease expired (no unprefixed ttl); the per-keyspace
+        // record for the same address is live. Never the stale allow-list.
+        let shared = kv(
+            "/topology/tidb/10.0.0.1:4000/info",
+            r#"{"ip":"10.0.0.1","multi_keyspace":true,"keyspaces":["ks1","ks2"]}"#,
+        );
+        let per_keyspace = kv(
+            "/keyspaces/tidb/ks1/topology/tidb/10.0.0.1:4000/info",
+            &info_value("10.0.0.1", 10080),
+        );
+        let keyspace_ttl = kv("/keyspaces/tidb/ks1/topology/tidb/10.0.0.1:4000/ttl", "1");
+        for entries in [
+            [shared.clone(), per_keyspace.clone(), keyspace_ttl.clone()],
+            [per_keyspace.clone(), shared.clone(), keyspace_ttl.clone()],
+        ] {
+            let backend = only_backend(&entries);
+            assert_eq!(backend.serves, KeyspaceScope::Single("ks1".to_owned()));
+        }
+        // A stale shared record alone is dropped, not served.
+        let alone = parse_tidb_topology(&[shared, keyspace_ttl]);
+        assert!(alone.backends.is_empty(), "{alone:?}");
+    }
+
+    #[test]
+    fn live_shared_process_record_needs_its_own_ttl() {
+        let backend = only_backend(&[
+            kv(
+                "/topology/tidb/10.0.0.1:4000/info",
+                r#"{"multi_keyspace":true,"keyspaces":"*"}"#,
+            ),
+            kv(
+                "/keyspaces/tidb/ks1/topology/tidb/10.0.0.1:4000/info",
+                &info_value("10.0.0.1", 10080),
+            ),
+            kv("/topology/tidb/10.0.0.1:4000/ttl", "1"),
+        ]);
+        assert_eq!(backend.serves, KeyspaceScope::Any);
     }
 
     #[test]

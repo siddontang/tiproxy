@@ -171,11 +171,12 @@ impl LocalRouteChannel {
                 RouteCode::NoBackend,
                 "No available TiDB instances, please make sure TiDB is available",
             ),
-            // Normally refused at admission with an access-denied error; this
-            // is the race where topology changed between admission and route.
-            // It is terminal and never falls back to a non-serving backend.
+            // Normally refused at admission; this is the race where the last
+            // serving backend left between admission and route. It keeps its
+            // own code so the client still gets the access-denied refusal,
+            // and it never falls back to a non-serving backend.
             RouteError::KeyspaceNotServed => (
-                RouteCode::NoBackend,
+                RouteCode::KeyspaceNotServed,
                 "No TiDB instance serves the keyspace selected by the user name",
             ),
             RouteError::Observer(_)
@@ -536,14 +537,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_channel_unserved_keyspace_is_terminal_no_backend() {
+    async fn local_channel_unserved_keyspace_keeps_its_typed_terminal() {
         let (mut channel, observed) = channel([Err(RouteError::KeyspaceNotServed)]);
         assert_eq!(channel.request_route(Vec::new()).await, Ok(()));
         let terminal = channel.next_assignment().await;
         let Ok(terminal) = terminal else {
             unreachable!("expected a terminal assignment: {terminal:?}")
         };
-        assert_eq!(terminal.code, RouteCode::NoBackend);
+        assert_eq!(terminal.code, RouteCode::KeyspaceNotServed);
         assert!(terminal.detail.contains("keyspace"));
         assert_eq!(
             observed

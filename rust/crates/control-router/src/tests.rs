@@ -410,6 +410,20 @@ impl Harness {
         proxy_zone: &str,
         fixture: KvFixture,
     ) -> TestResult<Self> {
+        Self::with_fixture_routing(rule, policy, backends, health, proxy_zone, fixture, false).await
+    }
+
+    /// [`Self::with_fixture`] with the `default` namespace's
+    /// `keyspace-routing` setting.
+    async fn with_fixture_routing(
+        rule: &str,
+        policy: &str,
+        backends: &[(&str, &[(&str, &str)])],
+        health: HealthCheckConfig,
+        proxy_zone: &str,
+        fixture: KvFixture,
+        keyspace_routing: bool,
+    ) -> TestResult<Self> {
         // Enabled rows use real SQL greeting probes. Empty IP selects the
         // production skip-HTTP path; no health verdict is fabricated here.
         fixture.backends_with_ip(backends, if health.enabled { "" } else { "127.0.0.1" });
@@ -426,6 +440,7 @@ impl Harness {
             (**current.effective()).clone(),
             vec![NamespaceConfig {
                 namespace: "default".into(),
+                keyspace_routing,
                 ..NamespaceConfig::default()
             }],
             SourceRevision {
@@ -2242,7 +2257,6 @@ async fn review_bscore_first_real_route_scoring_publishes() -> TestResult {
             backend_metrics: Arc::new(crate::BackendMetricHistory::new()),
             input_diagnostics: Arc::new(crate::plane::RouteInputDiagnostics::default()),
             history: Arc::new(crate::MigrationHistory::default()),
-            keyspace_memory: Arc::default(),
         },
     )
     .map_err(|e| format!("{e:?}"))?;
@@ -2440,7 +2454,6 @@ async fn review_step5_real_router_revocation_refuses_both_metrics_and_throttle()
                 backend_metrics: Arc::clone(&observations),
                 input_diagnostics: Arc::new(crate::plane::RouteInputDiagnostics::default()),
                 history: Arc::new(crate::MigrationHistory::default()),
-                keyspace_memory: Arc::default(),
             },
         )));
         let score_round = |router: &Router, candidate: &Candidate| -> Result<(), RouteError> {

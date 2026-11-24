@@ -240,10 +240,33 @@ Namespace values have a separate, equally exact classification:
 | `namespace`, `frontend.user` | Dynamic | CP-CFG persists identity and publishes immutable generations; CP-ROUTE owns listener/user binding and conflicts. |
 | every TLS field below `frontend.security` and `backend.security` | Dynamic, with auto-certs unsupported as above | CP-CFG validates and content-watches material; CP-ROUTE consumes it for new sessions. |
 | every entry in `backend.instances` | Dynamic | CP-CFG persists and orders it; CP-ROUTE owns backend binding. |
+| `keyspace-routing` (Rust-only, default `false`) | Dynamic, new router incarnation | Part of the CP-ROUTE namespace projection, so a change replaces the namespace router; existing sessions keep their router. |
 
 There is deliberately no namespace `keyspace` field. CP-TOPO discovers
 keyspaces and CP-ROUTE #147 binds them to sessions; #146 neither invents nor
 infers that association.
+
+`keyspace-routing` is a Rust-only extension for multi-keyspace `TiDB` nodes
+(discovered as shared backends with a `keyspaces` allow-list or `"*"`). It
+has no Go field: Go `config.Namespace` ignores it as an unknown member, and it
+is omitted from the canonical JSON while `false`, so legacy namespaces keep the
+Go-identical encoding and namespace checksum. A namespace with it set to `true`
+no longer matches the Go namespace checksum.
+
+- `false` (default, legacy): routing is unchanged and shared backends are never
+  selected for any login; each shared backend discovered in such a namespace is
+  logged once at `warn` (`shared_backend_in_legacy_namespace`).
+- `true`: a `<keyspace>.<user>` login (prefix before the first `.`) is routed
+  only to backends serving that keyspace (single-keyspace path equal, allow-list
+  containing it, or `"*"`), whatever discovery currently shows; when none does,
+  the login is refused with `1045`/`28000` access denied. A login without a
+  prefix may use every backend.
+
+Example `/config/ns/tenants` value:
+
+```json
+{"namespace":"tenants","keyspace-routing":true,"frontend":{},"backend":{}}
+```
 
 The config checksum is CRC32-IEEE over canonical TOML of the effective full
 config, matching Go. The namespace checksum is CRC32-IEEE over canonical JSON
