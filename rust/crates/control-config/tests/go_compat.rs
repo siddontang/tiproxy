@@ -223,3 +223,16 @@ fn tenant_migration_defaults_off_and_reloads_dynamically() {
         (ReloadClass::Dynamic, FieldEffect::Applied)
     );
 }
+
+#[test]
+fn billing_is_enabled_only_with_a_provider_and_a_bucket() {
+    let config = |provider: &str, bucket: &str| control_config::MeteringConfig {
+        provider_type: provider.to_owned(),
+        bucket: bucket.to_owned(),
+        ..control_config::MeteringConfig::default()
+    };
+    assert!(config("s3", "metering").billing_enabled());
+    assert!(!config("", "metering").billing_enabled());
+    assert!(!config("s3", "").billing_enabled());
+    assert!(!control_config::MeteringConfig::default().billing_enabled());
+}

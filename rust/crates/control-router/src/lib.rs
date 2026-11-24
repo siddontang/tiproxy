@@ -73,7 +73,7 @@ pub use migration_history::{
 };
 pub use retry::Selector;
 pub use score_history::{SCORE_METRIC_INTERVAL, ScoreHistory, ScoreSnapshot};
-pub use selector::{MigrationSink, Router};
+pub use selector::{ExecutionAuthority, MigrationSink, Router};
 pub use simulation::{MigrationSimulation, PreparedBalance, PreparedRedirect};
 
 #[cfg(test)]

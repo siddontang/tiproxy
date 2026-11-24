@@ -20,8 +20,8 @@
 //! selector ledger through `RouteAdmission` without involving the Go bridge.
 
 use control_router::{
-    Reservation, RouteAdmission, RouteCommandReceiver, RouteCommandRegistration, RouteError,
-    Settlement,
+    ExecutionAuthority, Reservation, RouteAdmission, RouteCommandReceiver,
+    RouteCommandRegistration, RouteError, Settlement,
 };
 use control_routing::group::ClientInfo;
 use control_routing::{RouteAssignment, RouteCode, RouteResult};
@@ -43,7 +43,7 @@ trait LocalRouteAuthority: Send + Sync {
     ) -> Result<RouteAssignment, RouteError>;
     fn finish(&mut self, assignment_id: &str, connected: bool) -> Option<Settlement>;
     fn change_user(&self, user: &str) -> bool;
-    fn revalidate_redirect(&self, target_id: &str) -> bool;
+    fn revalidate_redirect(&self, target_id: &str) -> Option<ExecutionAuthority>;
     fn identity_attributed_keyspace(&self) -> Option<String>;
 }
 
@@ -91,7 +91,7 @@ impl LocalRouteAuthority for PlaneRouteAuthority {
         self.admission.selector().change_user(user)
     }
 
-    fn revalidate_redirect(&self, target_id: &str) -> bool {
+    fn revalidate_redirect(&self, target_id: &str) -> Option<ExecutionAuthority> {
         self.admission.selector().revalidate_redirect(target_id)
     }
 
@@ -197,9 +197,10 @@ impl LocalRouteChannel {
 
     /// Revalidates this session's accepted redirect to `target_id` right
     /// before the engine captures session state and dials it. `false` means
-    /// the redirect must fail without any I/O to the target.
+    /// the redirect must fail without any I/O to the target; otherwise the
+    /// authority names the new connection's billing tenant.
     #[must_use = "a refused redirect must not be executed"]
-    pub fn revalidate_redirect(&self, target_id: &str) -> bool {
+    pub fn revalidate_redirect(&self, target_id: &str) -> Option<ExecutionAuthority> {
         self.authority.revalidate_redirect(target_id)
     }
 
@@ -310,6 +311,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, PoisonError};
 
+    use control_router::ExecutionAuthority;
     use control_routing::{RouteAssignment, RouteCode, RouteErrorSource, RouteResult};
     use tokio::sync::watch;
 
@@ -416,13 +418,13 @@ mod tests {
             None
         }
 
-        fn revalidate_redirect(&self, target_id: &str) -> bool {
+        fn revalidate_redirect(&self, target_id: &str) -> Option<ExecutionAuthority> {
             self.observed
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .revalidated
                 .push(target_id.to_owned());
-            true
+            Some(ExecutionAuthority::default())
         }
     }
 
@@ -707,7 +709,7 @@ mod tests {
     #[test]
     fn change_user_reaches_the_session_route_authority() {
         let (channel, observed) = channel([]);
-        assert!(channel.revalidate_redirect("backend-b"));
+        assert!(channel.revalidate_redirect("backend-b").is_some());
         assert_eq!(
             observed
                 .lock()

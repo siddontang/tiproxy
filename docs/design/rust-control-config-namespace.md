@@ -312,14 +312,20 @@ labels or the assignment keyspace derived from them.
 - Metering (design K4, brought forward for tenant sessions only): a tenant
   session on a shared backend is attributed to its session keyspace, at
   admission and when it moves onto one, instead of the empty keyspace that
-  detaches metering. Every other assignment keeps its keyspace. While a
-  metered session is attributed by its identity this way, a `COM_CHANGE_USER`
-  to another tenant's user is refused with `1045`/`28000` before it reaches
-  the backend (the session stays the tenant it is billed as); detaching would
-  leave the new tenant unbilled, and re-attributing would bill the old
-  tenant's history to it. On a single-keyspace backend the backend's own
-  tenant stays the billed keyspace, so the change-user is allowed. This holds
-  whether or not `balance.tenant-migration` is on.
+  detaches metering. Every other assignment keeps its keyspace. The billing
+  tenant belongs to the backend connection: it is set when a socket is
+  attached (admission) or opened by a redirect, from the scope verified for
+  that socket at that moment (including a reconnect to an address that has
+  since become shared), and installed together with the socket's metering
+  source at the swap. While billing is enabled (`metering.type` and
+  `metering.bucket` set; the metering registry is attached either way) and the
+  live connection is billed by identity, a `COM_CHANGE_USER` to another
+  tenant's user is refused with `1045`/`28000` before it reaches the backend,
+  so the session stays the tenant it is billed as; detaching would leave the
+  new tenant unbilled, and re-attributing would bill the old tenant's history
+  to it. On a single-keyspace backend the backend's own tenant stays the
+  billed keyspace, so the change-user is allowed. This holds whether or not
+  `balance.tenant-migration` is on.
 
 Example `/config/ns/tenants` value:
 

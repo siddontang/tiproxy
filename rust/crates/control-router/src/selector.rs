@@ -1257,42 +1257,53 @@ impl Router {
     /// source and target -- and requires the pending redirect to still
     /// target that exact backend. On success the target's verified scope is
     /// recorded as the scope authorizing this execution; settlement records
-    /// exactly it. On `false` the caller must fail the redirect without any
-    /// target-side I/O.
+    /// exactly it. The returned authority also names the billing tenant of
+    /// the new connection (see [`ExecutionAuthority`]). On `None` the caller
+    /// must fail the redirect without any target-side I/O.
     #[must_use = "a refused redirect must not be executed"]
-    pub fn revalidate_redirect(&self, session: &Session, target_id: &str) -> bool {
+    pub fn revalidate_redirect(
+        &self,
+        session: &Session,
+        target_id: &str,
+    ) -> Option<ExecutionAuthority> {
         let keyspace_routing = self.sources.keyspace_routing();
         if !keyspace_routing {
-            return true;
+            return Some(ExecutionAuthority::default());
         }
-        let Ok(candidate) = self.capture_retained() else {
-            return false;
-        };
+        let candidate = self.capture_retained().ok()?;
         let mut state = self.lock();
         if self.sources.validate(&candidate).is_err() || state.refresh(&candidate).is_err() {
-            return false;
+            return None;
         }
-        let Some((source, target)) = state
+        let (source, target) = state
             .ledger
             .pending_redirect(session)
-            .map(|(source, target)| (Arc::clone(source), Arc::clone(target)))
-        else {
-            return false;
-        };
+            .map(|(source, target)| (Arc::clone(source), Arc::clone(target)))?;
         if !state.session_migratable(session, keyspace_routing, Some(&candidate)) {
-            return false;
+            return None;
         }
-        let scope = if Arc::ptr_eq(&source, &target) {
+        // The connection being opened lands on `target_id`'s current
+        // record; a shared one bills the verified session keyspace.
+        let billing_tenant = |state: &State, backend: &Backend| {
+            if backend.source.backend.serves.is_shared() {
+                state.ledger.session_keyspace(session).map(str::to_owned)
+            } else {
+                None
+            }
+        };
+        let (scope, authority) = if Arc::ptr_eq(&source, &target) {
             // Reconnect to self: `session_migratable` checked the owner's
             // current record; it keeps the recorded scope.
-            if !state
+            let backend = state
                 .backends
                 .get(target_id)
-                .is_some_and(|backend| Arc::ptr_eq(&backend.account, &target))
-            {
-                return false;
-            }
-            None
+                .filter(|backend| Arc::ptr_eq(&backend.account, &target))?;
+            (
+                None,
+                ExecutionAuthority {
+                    billing_tenant: billing_tenant(&state, backend),
+                },
+            )
         } else {
             let Ok(backend) = state.redirect_target(
                 &source,
@@ -1301,15 +1312,20 @@ impl Router {
                 keyspace_routing,
                 crate::keyspace::TenantRule::Session(state.ledger.session_keyspace(session)),
             ) else {
-                return false;
+                return None;
             };
             if !Arc::ptr_eq(&backend.account, &target) {
-                return false;
+                return None;
             }
-            Some(Arc::clone(&backend.scope))
+            (
+                Some(Arc::clone(&backend.scope)),
+                ExecutionAuthority {
+                    billing_tenant: billing_tenant(&state, backend),
+                },
+            )
         };
         state.ledger.authorize_redirect(session, scope);
-        true
+        Some(authority)
     }
 
     /// The keyspace `session`'s metering is attributed to by its user
@@ -1471,6 +1487,16 @@ fn group_values(backend: &MergedBackend, rule: MatchType) -> Vec<String> {
             .into_iter()
             .collect(),
     }
+}
+
+/// What a revalidated redirect authorizes for the connection it opens.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionAuthority {
+    /// The tenant the new backend connection is billed to by the session's
+    /// verified user identity: the session keyspace when the target's
+    /// current record is a shared backend. `None` when the backend's own
+    /// keyspace decides billing (single-keyspace, classic, legacy).
+    pub billing_tenant: Option<String>,
 }
 
 impl State {

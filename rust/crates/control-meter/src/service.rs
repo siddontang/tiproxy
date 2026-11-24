@@ -118,7 +118,7 @@ impl Service {
         if !owner.is_current() {
             return Err(Error::Retired);
         }
-        let enabled = !config.provider_type.is_empty() && !config.bucket.is_empty();
+        let enabled = config.billing_enabled();
         let store = if enabled {
             Some(Store::new(config).await?)
         } else {

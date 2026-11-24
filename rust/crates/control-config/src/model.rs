@@ -2260,6 +2260,13 @@ impl fmt::Debug for MeteringConfig {
 }
 
 impl MeteringConfig {
+    /// Whether usage is billed: a provider and a bucket are configured. The
+    /// native meter otherwise runs its disabled (non-exporting) mode.
+    #[must_use]
+    pub fn billing_enabled(&self) -> bool {
+        !self.provider_type.is_empty() && !self.bucket.is_empty()
+    }
+
     fn is_zero(&self) -> bool {
         self.provider_type.is_empty()
             && self.region.is_empty()

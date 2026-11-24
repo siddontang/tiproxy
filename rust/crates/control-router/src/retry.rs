@@ -67,7 +67,7 @@ impl Selector {
     /// Revalidates this session's accepted redirect to `target_id` right
     /// before execution; see [`Router::revalidate_redirect`].
     #[must_use = "a refused redirect must not be executed"]
-    pub fn revalidate_redirect(&self, target_id: &str) -> bool {
+    pub fn revalidate_redirect(&self, target_id: &str) -> Option<crate::ExecutionAuthority> {
         self.router.revalidate_redirect(&self.session, target_id)
     }
 

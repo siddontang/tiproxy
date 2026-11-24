@@ -1296,6 +1296,13 @@ struct BackendIo {
     /// Whether the policy for `healthy` reached the raw socket. Failures are
     /// best-effort like Go and retried by the health ticker.
     keepalive_applied: bool,
+    /// The tenant THIS socket is billed to by the session's verified user
+    /// identity (a tenant session on a shared backend, where `keyspace` comes
+    /// from the session, not the backend); `None` when the backend's own
+    /// keyspace decides. Set when the socket is attached and installed with
+    /// it at every swap, together with its metering source, so billing guards
+    /// read the live connection rather than the router's routing record.
+    billing_tenant: Option<String>,
 }
 
 fn backend_health_in_snapshot(
@@ -2292,6 +2299,12 @@ impl Engine {
             local: backend_local,
             healthy: backend_healthy,
             keepalive_applied,
+            // Admission: the ledger records exactly the admitted backend's
+            // scope with the session keyspace.
+            billing_tenant: self
+                .local_route_lease
+                .as_ref()
+                .and_then(LocalRouteChannel::identity_attributed_keyspace),
         };
         // Backend responses are multi-packet result sets; over-read buffering
         // serves their physical packets from one transport read. The backend
@@ -3056,11 +3069,16 @@ impl Engine {
         // proxy no longer verifies or, if detached, unbilled. Refuse it
         // locally, before anything reaches the backend; the session stays
         // the tenant it is billed as.
-        if self.metering.is_some()
-            && let Some(lease) = &self.local_route_lease
-            && let Some(tenant) = lease.identity_attributed_keyspace()
+        if self
+            .metering
+            .as_ref()
+            .is_some_and(MeteringSourceRegistry::billing_enabled)
+            && let Some(tenant) = self
+                .backend
+                .as_ref()
+                .and_then(|backend| backend.billing_tenant.as_deref())
             && control_router::user_keyspace(&String::from_utf8_lossy(plan.pending.username()))
-                != Some(tenant.as_str())
+                != Some(tenant)
         {
             return self.refuse_cross_tenant_change_user().await;
         }
@@ -4412,12 +4430,17 @@ impl Engine {
         // router before any state is captured or the target is dialed; on
         // refusal the old backend stays the untouched sole owner and
         // nothing reaches the target.
-        if let (Some(target), Some(lease)) = (&self.redirect_target, &self.local_route_lease)
-            && !lease.revalidate_redirect(&target.backend_id)
-        {
-            let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
-            return;
-        }
+        let billing_tenant = match (&self.redirect_target, &self.local_route_lease) {
+            (Some(target), Some(lease)) => {
+                let Some(authority) = lease.revalidate_redirect(&target.backend_id) else {
+                    let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+                    return;
+                };
+                authority.billing_tenant
+            }
+            // The compatibility bridge has no tenant-aware namespaces.
+            _ => None,
+        };
         match self.capture_migration_snapshot().await {
             Ok(snapshot) => {
                 if let Some(state) = self.cmd_state.as_mut() {
@@ -4441,7 +4464,10 @@ impl Engine {
                 )
                 .await;
                 match candidate {
-                    Ok(Ok(candidate)) => {
+                    Ok(Ok(mut candidate)) => {
+                        // Installed with the socket at the swap, atomically
+                        // with its metering source.
+                        candidate.billing_tenant = billing_tenant;
                         self.candidate = Some(candidate);
                         let _ = self.events.send(SessionEvent::RedirectBackendReady).await;
                     }
@@ -4578,6 +4604,8 @@ impl Engine {
             local: target.backend_local,
             healthy: target.backend_healthy,
             keepalive_applied: false,
+            // Set by the caller from the execution authority.
+            billing_tenant: None,
         };
         // Same read-side over-read buffering as the primary connect path.
         candidate.backend_io.enable_read_buffering();

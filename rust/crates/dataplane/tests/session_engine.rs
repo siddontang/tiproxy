@@ -10686,3 +10686,81 @@ async fn unmetered_shared_session_allows_change_user_to_another_tenant() {
     plane.shutdown().await;
     backend.shutdown().await;
 }
+
+#[tokio::test]
+async fn reconnect_onto_a_now_shared_address_arms_the_billing_guard_at_the_swap() {
+    let Ok(registry) = MeteringSourceRegistry::new(11) else {
+        unreachable!("metering registry")
+    };
+    let (stack, plane, backend, mut client) = single_backend_tenant_session(
+        KeyspaceScope::Single("ksa".to_owned()),
+        true,
+        Some(registry.clone()),
+    )
+    .await;
+    let id = tenant_backend_id(backend.port);
+    assert!(client.query_ok("SELECT on_single").await);
+    // Discovery now describes the same address as serving ksa and ksb.
+    plane
+        .publish(&[(backend.port, tenants(&["ksa", "ksb"]))])
+        .await;
+    // Management reconnect-to-self moves the session onto a new socket to
+    // the (now shared) address.
+    let Ok(summary) = plane.handle.redirect_connections() else {
+        unreachable!("route plane is running")
+    };
+    assert_eq!(summary.accepted, 1, "reconnect-to-self accepted");
+    let reconnected = timeout(Duration::from_secs(8), async {
+        while backend.accepted.load(Ordering::Relaxed) < 2 || plane.unsettled_redirects() != 0 {
+            assert!(client.query_ok("SELECT waiting_for_reconnect").await);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(reconnected.is_ok(), "the reconnect completed");
+    assert_eq!(
+        attributions(&registry),
+        [
+            (id.clone(), "ksa".to_owned()),
+            (id.clone(), "ksa".to_owned())
+        ],
+        "the new socket still bills ksa"
+    );
+    // The new socket is billed by identity: the guard is armed on it.
+    let before = source_bytes(&registry);
+    assert_eq!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await,
+        Err(1045)
+    );
+    assert_eq!(source_bytes(&registry), before, "ksa's meter did not move");
+    assert!(client.query_ok("SELECT still_ksa").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn billing_disabled_allows_change_user_to_another_tenant() {
+    // The binary always attaches a registry; the provider setting decides.
+    let Ok(registry) = MeteringSourceRegistry::new(11) else {
+        unreachable!("metering registry")
+    };
+    let registry = registry.with_billing_enabled(false);
+    let (stack, plane, backend, mut client) =
+        single_backend_tenant_session(tenants(&["ksa", "ksb"]), false, Some(registry)).await;
+    assert!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await
+            .is_ok(),
+        "nothing is billed, so nothing is refused"
+    );
+    assert!(client.query_ok("SELECT as_ksb").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}

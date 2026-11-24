@@ -1222,7 +1222,9 @@ fn migrate(sim: &MigrationSimulation, prepared: &crate::PreparedRedirect, to: &s
     let redirect = must(sim.take_redirect().ok_or("admitted redirect"));
     assert_eq!(redirect.to().backend_id, to);
     assert!(
-        sim.router().revalidate_redirect(&prepared.session, to),
+        sim.router()
+            .revalidate_redirect(&prepared.session, to)
+            .is_some(),
         "execution revalidated"
     );
     assert_eq!(sim.finish(&redirect, true), Settlement::Applied);
@@ -1652,7 +1654,11 @@ async fn k3_execution_revalidates_an_accepted_redirect() -> TestResult {
     let changed = active_in(&sim, &on, SHARED_AB, Some("ksa"));
     let queued = accept(&sim, &must(sim.prepare(&changed, &on, SINGLE_A)));
     assert!(sim.router().change_user(&changed, "ksb.app"));
-    assert!(!sim.router().revalidate_redirect(&changed, SINGLE_A));
+    assert!(
+        sim.router()
+            .revalidate_redirect(&changed, SINGLE_A)
+            .is_none()
+    );
     assert_eq!(sim.finish(&queued, false), Settlement::Applied);
     assert_eq!((active(&sim, SHARED_AB), active(&sim, SINGLE_A)), (1, 0));
 
@@ -1667,14 +1673,22 @@ async fn k3_execution_revalidates_an_accepted_redirect() -> TestResult {
         K3_BACKENDS - 1,
     )
     .await;
-    assert!(!sim.router().revalidate_redirect(&withdrawn, SINGLE_A2));
+    assert!(
+        sim.router()
+            .revalidate_redirect(&withdrawn, SINGLE_A2)
+            .is_none()
+    );
     assert_eq!(sim.finish(&queued, false), Settlement::Applied);
 
     // Gate disabled while queued.
     let gated = active_in(&sim, &current, SINGLE_A, Some("ksa"));
     let queued = accept(&sim, &must(sim.prepare(&gated, &current, SHARED_AC)));
     tenant_migration_with(&h, &sim, false, 4, K3_BACKENDS - 1).await;
-    assert!(!sim.router().revalidate_redirect(&gated, SHARED_AC));
+    assert!(
+        sim.router()
+            .revalidate_redirect(&gated, SHARED_AC)
+            .is_none()
+    );
     assert_eq!(sim.finish(&queued, false), Settlement::Applied);
     assert_eq!(active(&sim, SHARED_AC), 0);
     for session in [changed, withdrawn, gated] {
@@ -1721,7 +1735,11 @@ async fn k3_settlement_records_the_scope_that_authorized_execution() -> TestResu
     let on = tenant_migration(&h, &sim, true, 3).await;
     let session = active_in(&sim, &on, SINGLE_A, None);
     let queued = accept(&sim, &must(sim.prepare(&session, &on, SINGLE_A2)));
-    assert!(sim.router().revalidate_redirect(&session, SINGLE_A2));
+    assert!(
+        sim.router()
+            .revalidate_redirect(&session, SINGLE_A2)
+            .is_some()
+    );
 
     // During the handshake discovery relabels the destination to ksb, and
     // the router refreshes before the result settles.
@@ -1800,7 +1818,11 @@ async fn k3_tenant_sessions_on_shared_backends_meter_their_keyspace() -> TestRes
         ),
         ("ksa", "ksa")
     );
-    assert!(sim.router().revalidate_redirect(&tenant, SINGLE_A));
+    assert!(
+        sim.router()
+            .revalidate_redirect(&tenant, SINGLE_A)
+            .is_some()
+    );
     assert_eq!(sim.finish(&to_single, true), Settlement::Applied);
     let to_shared = accept(&sim, &must(sim.prepare(&tenant, &on, SHARED_AC)));
     assert_eq!(to_shared.to().keyspace, "ksa");
