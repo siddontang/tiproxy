@@ -42,6 +42,11 @@ mod scheduler;
 
 struct Backend {
     source: MergedBackend,
+    /// `source.backend.serves`, shared by every reservation recorded on this
+    /// backend. Replaced only when discovery publishes a different scope, so
+    /// a long tenant allow-list is held once per backend record instead of
+    /// once per connection.
+    scope: Arc<KeyspaceScope>,
     routing_identity: RoutingIdentity,
     account: Arc<AccountIdentity>,
     healthy: bool,
@@ -596,7 +601,7 @@ impl Router {
         // restoration until valid routing labels have admitted this backend.
         backend.group.ok_or(RouteError::NoBackend)?;
         let account = Arc::clone(&backend.account);
-        let scope = Arc::new(backend.source.backend.serves.clone());
+        let scope = Arc::clone(&backend.scope);
         let result = assignment(&backend.source, candidate.health.get(id).local);
         self.sources.validate(&candidate)?;
         let reservation = state
@@ -783,7 +788,7 @@ impl Router {
         let backend = choices[index].0;
         let identity = Arc::clone(&backend.account);
         let local = candidate.health.get(&backend.source.backend_id).local;
-        let scope = Arc::new(backend.source.backend.serves.clone());
+        let scope = Arc::clone(&backend.scope);
         let assignment = assignment(&backend.source, local);
         self.sources.validate(candidate)?;
         state
@@ -850,7 +855,7 @@ impl Router {
                 .ok_or(RouteError::NoBackend)?;
             let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
             let identity = Arc::clone(&backend.account);
-            let scope = Arc::new(backend.source.backend.serves.clone());
+            let scope = Arc::clone(&backend.scope);
             let assignment = assignment(&backend.source, candidate.health.get(id).local);
             // Metrics qualify input data only. C/R/H and the ledger authorize
             // the effect, under this same lock and (when present) metric fence.
@@ -1167,6 +1172,12 @@ impl Router {
     /// Duplicate, foreign and late results have no effect.
     pub fn finish(&self, reservation: &Reservation, connected: bool) -> Settlement {
         self.lock().ledger.finish(reservation, connected)
+    }
+
+    /// The scope allocation recorded for an active session, for tests.
+    #[cfg(test)]
+    pub(crate) fn admitted_scope_for_test(&self, session: &Session) -> Option<Arc<KeyspaceScope>> {
+        self.lock().ledger.admitted_scope_arc(session).cloned()
     }
 
     /// Closes the exact session incarnation and returns any remaining accounting.
@@ -1596,6 +1607,9 @@ impl State {
                 server_version = health.server_version;
             }
             if let Some(backend) = self.backends.get_mut(&source.backend_id) {
+                if *backend.scope != source.backend.serves {
+                    backend.scope = Arc::new(source.backend.serves.clone());
+                }
                 backend.source = source.clone();
                 backend.healthy = healthy;
                 backend.supports_redirection = supports_redirection;
@@ -1605,6 +1619,7 @@ impl State {
                     Arc::clone(&source.backend_id),
                     Backend {
                         source: source.clone(),
+                        scope: Arc::new(source.backend.serves.clone()),
                         routing_identity: RoutingIdentity::new(&source.backend.addr),
                         account,
                         healthy,
@@ -1984,6 +1999,7 @@ mod score_publication_tests {
                         labels: BTreeMap::new(),
                     },
                 },
+                scope: Arc::new(control_topology::KeyspaceScope::default()),
                 account,
                 healthy: true,
                 supports_redirection: true,

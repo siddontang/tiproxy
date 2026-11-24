@@ -1040,3 +1040,74 @@ async fn retry_follows_tenant_between_existing_addresses() -> TestResult {
     assert_eq!(selector.finish(&after, false), Settlement::Applied);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sessions_on_one_backend_share_its_scope_allocation() -> TestResult {
+    // A long allow-list must be held once per backend record, not per session.
+    let tenants: Vec<String> = (0..512).map(|index| format!("ks{index}")).collect();
+    let (h, _) = harness_with(
+        &[(
+            PROCESS,
+            "127.0.0.1:4000",
+            shared(&serde_json::json!(tenants)),
+        )],
+        1,
+        true,
+    )
+    .await?;
+    let sim = simulation(&h);
+    let c = sim_ready(&sim, 1).await;
+    let first = active_on(&sim, &c, SET_KS1, &[]);
+    let second = active_on(&sim, &c, SET_KS1, &[]);
+    let (Some(a), Some(b)) = (
+        sim.router().admitted_scope_for_test(&first),
+        sim.router().admitted_scope_for_test(&second),
+    ) else {
+        return Err("both sessions are active".into());
+    };
+    assert!(Arc::ptr_eq(&a, &b), "one allocation per backend record");
+    assert!(a.serves("ks511"));
+
+    // A changed scope gets a new allocation, recorded for new sessions only.
+    h.fixture.info_records(&[(
+        PROCESS,
+        "127.0.0.1:4000",
+        shared(&serde_json::json!(["ks1"])),
+    )]);
+    let changed = sim_changed_routing(&sim, &c).await;
+    let third = active_on(&sim, &changed, SET_KS1, &[]);
+    let Some(c3) = sim.router().admitted_scope_for_test(&third) else {
+        return Err("third session is active".into());
+    };
+    assert!(!Arc::ptr_eq(&a, &c3));
+    assert!(!c3.serves("ks511") && c3.serves("ks1"));
+    let Some(still) = sim.router().admitted_scope_for_test(&first) else {
+        return Err("first session is still active".into());
+    };
+    assert!(
+        Arc::ptr_eq(&a, &still),
+        "admission scope is never rewritten"
+    );
+    for session in [first, second, third] {
+        sim.router().close(&session);
+    }
+    Ok(())
+}
+
+/// Waits for the simulation router to observe a routing snapshot other than
+/// `old`'s, whatever the configuration.
+async fn sim_changed_routing(sim: &MigrationSimulation, old: &Candidate) -> Candidate {
+    must(
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(candidate) = sim.router().capture()
+                    && !Arc::ptr_eq(&candidate.routing, &old.routing)
+                {
+                    break candidate;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await,
+    )
+}

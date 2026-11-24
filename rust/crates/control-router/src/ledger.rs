@@ -751,6 +751,15 @@ impl Ledger {
             .collect()
     }
 
+    /// The shared scope allocation behind [`Self::admitted_scope`].
+    #[cfg(test)]
+    pub(crate) fn admitted_scope_arc(&self, session: &Session) -> Option<&Arc<KeyspaceScope>> {
+        match self.stage(session) {
+            Ok(Stage::Active(active)) => Some(&active.scope),
+            _ => None,
+        }
+    }
+
     /// The backend discovery scope recorded when this active session was
     /// admitted (it is not updated by a later change of the address record).
     pub(crate) fn admitted_scope(&self, session: &Session) -> Option<&KeyspaceScope> {

@@ -83,6 +83,7 @@ fn shared_go_composition_observation() {
                             labels: must(serde_json::from_value(backend["labels"].clone())),
                         },
                     },
+                    scope: Arc::new(KeyspaceScope::default()),
                     routing_identity: RoutingIdentity::new(addr),
                     account: must(state.ledger.add_account()),
                     healthy: backend["healthy"].as_bool().unwrap_or(false),
