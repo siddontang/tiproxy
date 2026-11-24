@@ -20,8 +20,8 @@
 //! selector ledger through `RouteAdmission` without involving the Go bridge.
 
 use control_router::{
-    Reservation, RouteAdmission, RouteCommandReceiver, RouteCommandRegistration, RouteError,
-    Settlement,
+    ExecutionAuthority, Reservation, RouteAdmission, RouteCommandReceiver,
+    RouteCommandRegistration, RouteError, Settlement,
 };
 use control_routing::group::ClientInfo;
 use control_routing::{RouteAssignment, RouteCode, RouteResult};
@@ -42,6 +42,9 @@ trait LocalRouteAuthority: Send + Sync {
         listener_port: &str,
     ) -> Result<RouteAssignment, RouteError>;
     fn finish(&mut self, assignment_id: &str, connected: bool) -> Option<Settlement>;
+    fn change_user(&self, user: &str) -> bool;
+    fn revalidate_redirect(&self, target_id: &str) -> Option<ExecutionAuthority>;
+    fn identity_attributed_keyspace(&self) -> Option<String>;
 }
 
 struct PlaneRouteAuthority {
@@ -82,6 +85,18 @@ impl LocalRouteAuthority for PlaneRouteAuthority {
             return None;
         }
         Some(self.admission.selector().finish(&reservation, connected))
+    }
+
+    fn change_user(&self, user: &str) -> bool {
+        self.admission.selector().change_user(user)
+    }
+
+    fn revalidate_redirect(&self, target_id: &str) -> Option<ExecutionAuthority> {
+        self.admission.selector().revalidate_redirect(target_id)
+    }
+
+    fn identity_attributed_keyspace(&self) -> Option<String> {
+        self.admission.selector().identity_attributed_keyspace()
     }
 }
 
@@ -162,6 +177,31 @@ impl LocalRouteChannel {
     #[must_use]
     pub fn namespace(&self) -> &str {
         self.authority.namespace()
+    }
+
+    /// Reports a `COM_CHANGE_USER` the backend accepted, so the router stops
+    /// treating the session as bound to its admission keyspace when the new
+    /// user names another one. Returns whether the session keyspace was
+    /// cleared.
+    #[must_use = "callers may log or count a cleared session keyspace"]
+    pub fn change_user(&self, user: &str) -> bool {
+        self.authority.change_user(user)
+    }
+
+    /// The keyspace this session's metering is attributed to by its user
+    /// identity (a tenant session on a shared backend), if any.
+    #[must_use]
+    pub fn identity_attributed_keyspace(&self) -> Option<String> {
+        self.authority.identity_attributed_keyspace()
+    }
+
+    /// Revalidates this session's accepted redirect to `target_id` right
+    /// before the engine captures session state and dials it. `false` means
+    /// the redirect must fail without any I/O to the target; otherwise the
+    /// authority names the new connection's billing tenant.
+    #[must_use = "a refused redirect must not be executed"]
+    pub fn revalidate_redirect(&self, target_id: &str) -> Option<ExecutionAuthority> {
+        self.authority.revalidate_redirect(target_id)
     }
 
     fn terminal(&self, error: RouteError) -> RouteAssignment {
@@ -271,6 +311,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex, PoisonError};
 
+    use control_router::ExecutionAuthority;
     use control_routing::{RouteAssignment, RouteCode, RouteErrorSource, RouteResult};
     use tokio::sync::watch;
 
@@ -283,6 +324,8 @@ mod tests {
     struct Observed {
         calls: Vec<(String, String, String)>,
         finishes: Vec<(String, bool)>,
+        changed_users: Vec<String>,
+        revalidated: Vec<String>,
         drops: usize,
         active: usize,
     }
@@ -360,6 +403,28 @@ mod tests {
                 observed.active += 1;
             }
             Some(Settlement::Applied)
+        }
+
+        fn change_user(&self, user: &str) -> bool {
+            self.observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .changed_users
+                .push(user.to_owned());
+            true
+        }
+
+        fn identity_attributed_keyspace(&self) -> Option<String> {
+            None
+        }
+
+        fn revalidate_redirect(&self, target_id: &str) -> Option<ExecutionAuthority> {
+            self.observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .revalidated
+                .push(target_id.to_owned());
+            Some(ExecutionAuthority::default())
         }
     }
 
@@ -638,6 +703,27 @@ mod tests {
                 .calls
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn change_user_reaches_the_session_route_authority() {
+        let (channel, observed) = channel([]);
+        assert!(channel.revalidate_redirect("backend-b").is_some());
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .revalidated,
+            ["backend-b".to_owned()]
+        );
+        assert!(channel.change_user("ks2.app"));
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .changed_users,
+            ["ks2.app".to_owned()]
         );
     }
 

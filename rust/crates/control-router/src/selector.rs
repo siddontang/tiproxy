@@ -42,6 +42,11 @@ mod scheduler;
 
 struct Backend {
     source: MergedBackend,
+    /// `source.backend.serves`, shared by every reservation recorded on this
+    /// backend. Replaced only when discovery publishes a different scope, so
+    /// a long tenant allow-list is held once per backend record instead of
+    /// once per connection.
+    scope: Arc<KeyspaceScope>,
     routing_identity: RoutingIdentity,
     account: Arc<AccountIdentity>,
     healthy: bool,
@@ -596,12 +601,14 @@ impl Router {
         // restoration until valid routing labels have admitted this backend.
         backend.group.ok_or(RouteError::NoBackend)?;
         let account = Arc::clone(&backend.account);
-        let scope = Arc::new(backend.source.backend.serves.clone());
+        let scope = Arc::clone(&backend.scope);
         let result = assignment(&backend.source, candidate.health.get(id).local);
         self.sources.validate(&candidate)?;
         let reservation = state
             .ledger
-            .reserve_scoped(session, &account, result, scope)?;
+            // A restored session's user name is not known here, so it has no
+            // session keyspace.
+            .reserve_scoped(session, &account, result, scope, None)?;
         let result = reservation.assignment().clone();
         let settled = state.ledger.finish(&reservation, true);
         debug_assert_eq!(settled, Settlement::Applied);
@@ -783,12 +790,18 @@ impl Router {
         let backend = choices[index].0;
         let identity = Arc::clone(&backend.account);
         let local = candidate.health.get(&backend.source.backend_id).local;
-        let scope = Arc::new(backend.source.backend.serves.clone());
-        let assignment = assignment(&backend.source, local);
+        let scope = Arc::clone(&backend.scope);
+        let assignment = tenant_assignment(&backend.source, local, keyspace.session_keyspace());
         self.sources.validate(candidate)?;
         state
             .ledger
-            .reserve_scoped(session, &identity, assignment, scope)
+            .reserve_scoped(
+                session,
+                &identity,
+                assignment,
+                scope,
+                keyspace.session_keyspace().map(Arc::from),
+            )
             .map_err(Into::into)
     }
 
@@ -850,14 +863,22 @@ impl Router {
                 .ok_or(RouteError::NoBackend)?;
             let backend = state.backends.get(id).ok_or(RouteError::NoBackend)?;
             let identity = Arc::clone(&backend.account);
-            let scope = Arc::new(backend.source.backend.serves.clone());
-            let assignment = assignment(&backend.source, candidate.health.get(id).local);
+            let scope = Arc::clone(&backend.scope);
+            let assignment = tenant_assignment(
+                &backend.source,
+                candidate.health.get(id).local,
+                keyspace.session_keyspace(),
+            );
             // Metrics qualify input data only. C/R/H and the ledger authorize
             // the effect, under this same lock and (when present) metric fence.
             self.sources.validate(candidate)?;
-            let reserved = state
-                .ledger
-                .reserve_scoped(session, &identity, assignment, scope)?;
+            let reserved = state.ledger.reserve_scoped(
+                session,
+                &identity,
+                assignment,
+                scope,
+                keyspace.session_keyspace().map(Arc::from),
+            )?;
             if metrics.is_some()
                 && let Some(diagnostics) = &self.input_diagnostics
             {
@@ -971,14 +992,16 @@ impl Router {
         let source = Arc::clone(state.ledger.active_owner(session)?);
         // The admission-time fact, not the address's current scope: a record
         // flipping from shared to single must not make this session movable.
-        if !state.session_migratable(session, self.sources.keyspace_routing()) {
+        let keyspace_routing = self.sources.keyspace_routing();
+        if !state.session_migratable(session, keyspace_routing, Some(candidate)) {
             return Err(RouteError::CrossKeyspace);
         }
         let target = state.redirect_target(
             &source,
             candidate,
             target_id,
-            self.sources.keyspace_routing(),
+            keyspace_routing,
+            crate::keyspace::TenantRule::Session(state.ledger.session_keyspace(session)),
         )?;
         self.sources.validate(candidate)?;
         Ok(crate::PreparedRedirect {
@@ -1061,19 +1084,36 @@ impl Router {
         }
         state.refresh(&prepared.candidate)?;
         // Every offer (direct, balance, failover-driven) funnels through here.
-        let target = if state.session_migratable(&prepared.session, self.sources.keyspace_routing())
-        {
+        let keyspace_routing = self.sources.keyspace_routing();
+        let target = if state.session_migratable(
+            &prepared.session,
+            keyspace_routing,
+            Some(&prepared.candidate),
+        ) {
             state.redirect_target(
                 &prepared.source,
                 &prepared.candidate,
                 &prepared.target_id,
-                self.sources.keyspace_routing(),
+                keyspace_routing,
+                crate::keyspace::TenantRule::Session(
+                    state.ledger.session_keyspace(&prepared.session),
+                ),
             )
         } else {
             Err(RouteError::CrossKeyspace)
         };
         let target = match target {
             Ok(target) => target,
+            // Tenant-aware: this session is merely ineligible for this pair
+            // (another tenant on an overlapping source, a pinned session).
+            // Skip it without renewing its failure cooldown or recording a
+            // refusal: no command was attempted, and renewing the cooldown
+            // on every pass would keep the failover-timeout close (which
+            // honors that cooldown) from ever reaching the session.
+            Err(RouteError::CrossKeyspace) if keyspace_routing => {
+                self.sources.validate(&prepared.candidate)?;
+                return Ok(None);
+            }
             Err(RouteError::CrossKeyspace) => {
                 self.sources.validate(&prepared.candidate)?;
                 state.ledger.reject_keyspace(&prepared.session, now)?;
@@ -1085,16 +1125,24 @@ impl Router {
         if !Arc::ptr_eq(&target.account, &prepared.target) {
             return Err(RouteError::StaleCandidate);
         }
-        let assignment = assignment(
+        // A tenant session moving onto a shared backend keeps its metering
+        // keyspace (the target was just checked to serve it).
+        let assignment = tenant_assignment(
             &target.source,
             prepared.candidate.health.get(&prepared.target_id).local,
+            if keyspace_routing {
+                state.ledger.session_keyspace(&prepared.session)
+            } else {
+                None
+            },
         );
-        let redirect = match state.ledger.prepare_redirect(
+        let redirect = match state.ledger.prepare_redirect_scoped(
             &prepared.session,
             &prepared.target,
             assignment,
             now,
             prepared.reason,
+            keyspace_routing,
         ) {
             Ok(redirect) => redirect,
             Err(crate::ledger::LedgerError::CrossKeyspace) => {
@@ -1121,14 +1169,28 @@ impl Router {
     ) -> crate::RedirectAllSummary {
         let mut summary = crate::RedirectAllSummary::default();
         let mut rejected = Vec::new();
+        let keyspace_routing = self.sources.keyspace_routing();
+        // A tenant-aware reconnect is checked against a current snapshot, so
+        // capture one now: a reconnect may be the first operation after a
+        // publication or a withdrawal. Without one every tenant-aware offer
+        // is refused.
+        let current = if keyspace_routing {
+            self.capture_retained().ok()
+        } else {
+            None
+        };
         {
             let mut state = self.lock();
+            // Refresh first, so the router's state reflects that snapshot.
+            let current = current.filter(|candidate| {
+                self.sources.validate(candidate).is_ok() && state.refresh(candidate).is_ok()
+            });
             summary.active = state.ledger.evidence().active;
             for session in state.ledger.redirectable_sessions() {
                 summary.offered += 1;
                 // A reconnect is a migration too; a refused offer is not an
                 // error.
-                if !state.session_migratable(&session, self.sources.keyspace_routing()) {
+                if !state.session_migratable(&session, keyspace_routing, current.as_ref()) {
                     continue;
                 }
                 let Ok(redirect) = state.ledger.prepare_self_redirect(&session, now) else {
@@ -1158,7 +1220,14 @@ impl Router {
         now: Instant,
     ) -> Settlement {
         let mut state = self.lock();
-        let settlement = state.ledger.finish_redirect(redirect, success, now);
+        // The recorded scope comes from the execution-time authorization,
+        // never from this (possibly refreshed) router state.
+        let settlement = state.ledger.finish_redirect_scoped(
+            redirect,
+            success,
+            now,
+            self.sources.keyspace_routing(),
+        );
         self.publish_migrations(state.ledger.drain_migrations());
         settlement
     }
@@ -1167,6 +1236,124 @@ impl Router {
     /// Duplicate, foreign and late results have no effect.
     pub fn finish(&self, reservation: &Reservation, connected: bool) -> Settlement {
         self.lock().ledger.finish(reservation, connected)
+    }
+
+    /// The scope allocation recorded for an active session, for tests.
+    #[cfg(test)]
+    pub(crate) fn admitted_scope_for_test(&self, session: &Session) -> Option<Arc<KeyspaceScope>> {
+        self.lock().ledger.admitted_scope_arc(session).cloned()
+    }
+
+    /// Revalidates `session`'s accepted redirect to `target_id` right before
+    /// the session engine captures state and dials (a queued redirect can
+    /// wait for a transaction boundary while the session, discovery or
+    /// configuration changes).
+    ///
+    /// Legacy namespaces: always `true` (unchanged). Tenant-aware
+    /// (`keyspace-routing`) namespaces: re-applies every redirect check
+    /// against a freshly captured and applied routing snapshot --
+    /// `balance.tenant-migration` still on, the session keyspace after any
+    /// `COM_CHANGE_USER`, current-snapshot membership and verified scope of
+    /// source and target -- and requires the pending redirect to still
+    /// target that exact backend. On success the target's verified scope is
+    /// recorded as the scope authorizing this execution; settlement records
+    /// exactly it. The returned authority also names the billing tenant of
+    /// the new connection (see [`ExecutionAuthority`]). On `None` the caller
+    /// must fail the redirect without any target-side I/O.
+    #[must_use = "a refused redirect must not be executed"]
+    pub fn revalidate_redirect(
+        &self,
+        session: &Session,
+        target_id: &str,
+    ) -> Option<ExecutionAuthority> {
+        let keyspace_routing = self.sources.keyspace_routing();
+        if !keyspace_routing {
+            return Some(ExecutionAuthority::default());
+        }
+        let candidate = self.capture_retained().ok()?;
+        let mut state = self.lock();
+        if self.sources.validate(&candidate).is_err() || state.refresh(&candidate).is_err() {
+            return None;
+        }
+        let (source, target) = state
+            .ledger
+            .pending_redirect(session)
+            .map(|(source, target)| (Arc::clone(source), Arc::clone(target)))?;
+        if !state.session_migratable(session, keyspace_routing, Some(&candidate)) {
+            return None;
+        }
+        // The connection being opened lands on `target_id`'s current
+        // record; a shared one bills the verified session keyspace.
+        let billing_tenant = |state: &State, backend: &Backend| {
+            if backend.source.backend.serves.is_shared() {
+                state.ledger.session_keyspace(session).map(str::to_owned)
+            } else {
+                None
+            }
+        };
+        let (scope, authority) = if Arc::ptr_eq(&source, &target) {
+            // Reconnect to self: `session_migratable` checked the owner's
+            // current record; it keeps the recorded scope.
+            let backend = state
+                .backends
+                .get(target_id)
+                .filter(|backend| Arc::ptr_eq(&backend.account, &target))?;
+            (
+                None,
+                ExecutionAuthority {
+                    billing_tenant: billing_tenant(&state, backend),
+                },
+            )
+        } else {
+            let Ok(backend) = state.redirect_target(
+                &source,
+                &candidate,
+                target_id,
+                keyspace_routing,
+                crate::keyspace::TenantRule::Session(state.ledger.session_keyspace(session)),
+            ) else {
+                return None;
+            };
+            if !Arc::ptr_eq(&backend.account, &target) {
+                return None;
+            }
+            (
+                Some(Arc::clone(&backend.scope)),
+                ExecutionAuthority {
+                    billing_tenant: billing_tenant(&state, backend),
+                },
+            )
+        };
+        state.ledger.authorize_redirect(session, scope);
+        Some(authority)
+    }
+
+    /// The keyspace `session`'s metering is attributed to by its user
+    /// identity, if any: a tenant session (`keyspace-routing`, prefixed
+    /// login) on a shared backend, whose assignment keyspace comes from the
+    /// session rather than from the backend. The session engine refuses a
+    /// `COM_CHANGE_USER` to another tenant's user while it meters such a
+    /// session, so billing never continues under an identity the proxy no
+    /// longer verifies.
+    #[must_use]
+    pub fn identity_attributed_keyspace(&self, session: &Session) -> Option<String> {
+        if !self.sources.keyspace_routing() {
+            return None;
+        }
+        self.lock()
+            .ledger
+            .identity_attributed(session)
+            .map(str::to_owned)
+    }
+
+    /// Records a successful `COM_CHANGE_USER` to `user` on `session`. A user
+    /// with a different `<keyspace>.` prefix clears the session keyspace for
+    /// the rest of the session (fail closed; see `Ledger::change_user`).
+    /// Returns whether it was cleared. Foreign or inactive sessions are
+    /// ignored.
+    #[must_use = "callers may log or count a cleared session keyspace"]
+    pub fn change_user(&self, session: &Session, user: &str) -> bool {
+        self.lock().ledger.change_user(session, user)
     }
 
     /// Closes the exact session incarnation and returns any remaining accounting.
@@ -1302,19 +1489,40 @@ fn group_values(backend: &MergedBackend, rule: MatchType) -> Vec<String> {
     }
 }
 
+/// What a revalidated redirect authorizes for the connection it opens.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExecutionAuthority {
+    /// The tenant the new backend connection is billed to by the session's
+    /// verified user identity: the session keyspace when the target's
+    /// current record is a shared backend. `None` when the backend's own
+    /// keyspace decides billing (single-keyspace, classic, legacy).
+    pub billing_tenant: Option<String>,
+}
+
 impl State {
     /// Whether `session` may be offered any redirect, including a reconnect
     /// to its own backend. The target side is checked by `redirect_target`.
     ///
     /// Legacy namespaces: refused only for a session admitted on, or now
-    /// owned by, a shared backend. Tenant-aware (`keyspace-routing`)
-    /// namespaces: always refused in PR 1 (see
-    /// [`crate::keyspace::TENANT_REDIRECTS_ENABLED`]). Behind that gate the
-    /// session must have been admitted on a verified single keyspace and its
-    /// owner must still be that verified keyspace by discovery scope, so an
-    /// address that changed tenant, became unverified, or carries only a
-    /// label never qualifies. An unknown owner is refused.
-    fn session_migratable(&self, session: &Session, keyspace_routing: bool) -> bool {
+    /// owned by, a shared backend.
+    ///
+    /// Tenant-aware (`keyspace-routing`) namespaces: refused unless
+    /// `balance.tenant-migration` is on in `current`, the routing snapshot the
+    /// decision is made against. The owner must have a record in that
+    /// snapshot (a withdrawn address retained for its sessions has none), and
+    /// [`crate::keyspace::session_on_tenant`] must hold for the session's
+    /// admission (or last moved-onto) scope and the owner's current record. So a session
+    /// with a keyspace may sit on a shared backend serving it (the only pin
+    /// the flag relaxes), and every other session must still be on the
+    /// verified single keyspace it was admitted on: an address that changed
+    /// tenant, became unverified, or carries only a label never qualifies.
+    /// An unknown owner is refused.
+    fn session_migratable(
+        &self,
+        session: &Session,
+        keyspace_routing: bool,
+        current: Option<&Candidate>,
+    ) -> bool {
         let (Ok(owner), Some(admitted)) = (
             self.ledger.active_owner(session),
             self.ledger.admitted_scope(session),
@@ -1331,17 +1539,31 @@ impl State {
         if !keyspace_routing {
             return !admitted.is_shared() && !source.source.backend.serves.is_shared();
         }
-        crate::keyspace::TENANT_REDIRECTS_ENABLED
-            && matches!(admitted, KeyspaceScope::Single(tenant)
-                if crate::keyspace::verified_tenant(&source.source, tenant))
+        let Some(current) = current.filter(|candidate| candidate.policy.tenant_migration) else {
+            return false;
+        };
+        crate::keyspace::current_record(
+            &current.routing.backends.backends,
+            &source.source.backend_id,
+        )
+        .is_some_and(|owner| {
+            crate::keyspace::session_on_tenant(
+                self.ledger.session_keyspace(session),
+                admitted,
+                owner,
+            )
+        })
     }
 
+    /// The redirect target for `source`'s session, or for a balance pair
+    /// (`rule`; only tenant-aware namespaces use it).
     fn redirect_target(
         &self,
         source: &Arc<AccountIdentity>,
         candidate: &Candidate,
         target_id: &str,
         keyspace_routing: bool,
+        rule: crate::keyspace::TenantRule<'_>,
     ) -> Result<&Backend, RouteError> {
         let physical = self
             .backends
@@ -1350,7 +1572,8 @@ impl State {
             .ok_or(RouteError::StaleCandidate)?;
         let group = physical.group.ok_or(RouteError::NoBackend)?;
         let target = self
-            // Shared targets are refused below whatever the namespace mode.
+            // Shared targets are refused below unless the tenant rule admits
+            // them.
             .routeable(
                 group,
                 &candidate.policy,
@@ -1367,12 +1590,26 @@ impl State {
         // Every refusal reuses the cross-keyspace path, so balance skips the
         // round without moving anything.
         if keyspace_routing {
-            // Tenant-aware: disabled in PR 1. Behind the gate both sides must
-            // be the same verified single keyspace by discovery scope; the
-            // label-derived assignment keyspace is never trusted here.
-            let same_tenant = matches!(&physical.source.backend.serves, KeyspaceScope::Single(tenant)
-                if crate::keyspace::verified_tenant(&target.source, tenant));
-            return if crate::keyspace::TENANT_REDIRECTS_ENABLED && same_tenant {
+            // Tenant-aware: only behind `balance.tenant-migration`, and only
+            // on the records both sides have in this exact snapshot, compared
+            // by discovery scope; the label-derived assignment keyspace is
+            // never trusted here. The session side is checked by
+            // `session_migratable`, which also supplies the admission scope.
+            let backends = &candidate.routing.backends.backends;
+            let tenant_ok = candidate.policy.tenant_migration
+                && match (
+                    crate::keyspace::current_record(backends, &physical.source.backend_id),
+                    crate::keyspace::current_record(backends, target_id),
+                ) {
+                    (Some(from), Some(to)) => match rule {
+                        crate::keyspace::TenantRule::Session(keyspace) => {
+                            crate::keyspace::tenant_target(keyspace, from, to)
+                        }
+                        crate::keyspace::TenantRule::Pair => crate::keyspace::tenant_pair(from, to),
+                    },
+                    _ => false,
+                };
+            return if tenant_ok {
                 Ok(target)
             } else {
                 Err(RouteError::CrossKeyspace)
@@ -1596,6 +1833,9 @@ impl State {
                 server_version = health.server_version;
             }
             if let Some(backend) = self.backends.get_mut(&source.backend_id) {
+                if *backend.scope != source.backend.serves {
+                    backend.scope = Arc::new(source.backend.serves.clone());
+                }
                 backend.source = source.clone();
                 backend.healthy = healthy;
                 backend.supports_redirection = supports_redirection;
@@ -1605,6 +1845,7 @@ impl State {
                     Arc::clone(&source.backend_id),
                     Backend {
                         source: source.clone(),
+                        scope: Arc::new(source.backend.serves.clone()),
                         routing_identity: RoutingIdentity::new(&source.backend.addr),
                         account,
                         healthy,
@@ -1745,6 +1986,27 @@ pub(crate) fn assignment_keyspace_for_test(source: &MergedBackend) -> String {
     assignment(source, false).keyspace
 }
 
+/// [`assignment`] for a session with a session keyspace (a tenant session in
+/// a `keyspace-routing` namespace). On a shared backend, which has no single
+/// keyspace of its own, the assignment (and so metering) is attributed to
+/// the session keyspace the backend was verified to serve. This brings the
+/// per-session keyspace attribution of design K4 forward for tenant
+/// sessions; every other assignment is unchanged.
+fn tenant_assignment(
+    source: &MergedBackend,
+    local: bool,
+    session_keyspace: Option<&str>,
+) -> RouteAssignment {
+    let mut result = assignment(source, local);
+    if let Some(keyspace) = session_keyspace
+        && source.backend.serves.is_shared()
+        && source.backend.serves.serves(keyspace)
+    {
+        keyspace.clone_into(&mut result.keyspace);
+    }
+    result
+}
+
 fn assignment(source: &MergedBackend, local: bool) -> RouteAssignment {
     // Locality belongs to the same exact H that admitted this reservation.
     // Current routing config can be newer than the config observed by that H.
@@ -1753,7 +2015,7 @@ fn assignment(source: &MergedBackend, local: bool) -> RouteAssignment {
         backend_address: source.backend.addr.clone(),
         cluster_name: source.cluster_name.to_string(),
         // A shared backend has no single keyspace; never borrow an operator
-        // label for it (per-session keyspace attribution is a later slice).
+        // label for it. Tenant sessions get theirs from `tenant_assignment`.
         keyspace: if source.backend.serves.is_shared() {
             String::new()
         } else if source.backend.keyspace().is_empty() {
@@ -1984,6 +2246,7 @@ mod score_publication_tests {
                         labels: BTreeMap::new(),
                     },
                 },
+                scope: Arc::new(control_topology::KeyspaceScope::default()),
                 account,
                 healthy: true,
                 supports_redirection: true,

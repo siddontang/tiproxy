@@ -2303,6 +2303,16 @@ impl MysqlClient {
         password: &str,
         proxy_header: Option<&[u8]>,
     ) -> Result<Self, Vec<u8>> {
+        Self::login_user(port, b"root", password, proxy_header).await
+    }
+
+    /// [`Self::login_with_proxy_header`] as `user`.
+    async fn login_user(
+        port: u16,
+        user: &[u8],
+        password: &str,
+        proxy_header: Option<&[u8]>,
+    ) -> Result<Self, Vec<u8>> {
         let stream = Self::open_stream(port, proxy_header).await?;
         let (read, write) = stream.into_split();
         let mut reader = PacketReader::new(read);
@@ -2338,7 +2348,7 @@ impl MysqlClient {
             capabilities,
             max_packet_size: 16 * 1024 * 1024,
             collation: 45,
-            username: b"root",
+            username: user,
             auth_response: &first_scramble,
             database: None,
             auth_plugin_name: Some(b"mysql_native_password"),
@@ -10061,4 +10071,696 @@ async fn handshake_then_disconnect_settles_nothing_twice() {
     );
     assert_eq!(settled_bytes, 0, "nothing is settled again at session end");
     stack.dispatch_task.abort();
+}
+
+// K3 tenant migration through the real session engine: a `keyspace-routing`
+// namespace whose backends and tenant scopes are published through the
+// topology replay input, a production route plane and worker, and the
+// production local route path in the session owner.
+
+use control_topology::KeyspaceScope;
+
+/// One backend cluster at an unreachable PD, so topology runs in dynamic
+/// (discovered) mode while its discovery never succeeds: every backend the
+/// router sees comes from the replay input.
+struct UnreachableClusterFactory;
+
+impl control_topology::TopologyClientFactory for UnreachableClusterFactory {
+    fn build(
+        &self,
+        _snapshot: &control_config::ConfigNamespaceSnapshot,
+    ) -> Result<Vec<control_topology::TopologyClusterClient>, String> {
+        let client = control_external::EtcdClientConfig::new(["127.0.0.1:1".to_owned()], None)
+            .map_err(|error| format!("{error:?}"))?;
+        Ok(vec![control_topology::TopologyClusterClient {
+            cluster_name: Arc::from("default"),
+            client,
+        }])
+    }
+}
+
+/// The route plane of one tenant-aware namespace over replayed backends.
+struct TenantRoutePlane {
+    handle: control_router::RoutePlaneHandle,
+    store: Arc<control_config::ConfigNamespaceStore>,
+    topology: control_topology::TopologyModuleHandle,
+    input: control_topology::api_replay::HealthInput,
+    revision: u64,
+    _runtime: control_plane::ControlRuntime,
+    topology_task: tokio::task::JoinHandle<Result<(), control_plane::ModuleError>>,
+    plane_task: tokio::task::JoinHandle<Result<(), control_plane::ModuleError>>,
+}
+
+fn tenant_backend_id(port: u16) -> String {
+    format!("default/127.0.0.1:{port}")
+}
+
+fn tenants(keyspaces: &[&str]) -> KeyspaceScope {
+    KeyspaceScope::Set(keyspaces.iter().map(|ks| (*ks).to_owned()).collect())
+}
+
+impl TenantRoutePlane {
+    /// Publishes exactly `backends` (healthy, redirect-capable) as discovery,
+    /// once discovery has bound its first epoch.
+    async fn publish(&self, backends: &[(u16, KeyspaceScope)]) {
+        let mut last = "never attempted";
+        let published = timeout(Duration::from_secs(5), async {
+            loop {
+                match self.try_publish(backends) {
+                    Ok(()) => break,
+                    Err(error) => last = error,
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(published.is_ok(), "replayed topology publishes: {last}");
+    }
+
+    fn try_publish(&self, backends: &[(u16, KeyspaceScope)]) -> Result<(), &'static str> {
+        use control_topology::{BackendHealth, BackendInfo, MergedBackend, MergedTopology};
+        let mut merged = Vec::new();
+        let mut health = HashMap::new();
+        let mut redirection = HashMap::new();
+        for (port, serves) in backends {
+            let id: Arc<str> = Arc::from(tenant_backend_id(*port));
+            merged.push(MergedBackend {
+                backend_id: Arc::clone(&id),
+                cluster_name: Arc::from("default"),
+                backend: BackendInfo {
+                    addr: format!("127.0.0.1:{port}"),
+                    serves: serves.clone(),
+                    ip: "127.0.0.1".to_owned(),
+                    status_port: 0,
+                    version: String::new(),
+                    git_hash: String::new(),
+                    deploy_path: String::new(),
+                    start_timestamp: 0,
+                    labels: std::collections::BTreeMap::new(),
+                },
+            });
+            health.insert(
+                Arc::clone(&id),
+                BackendHealth {
+                    healthy: true,
+                    local: true,
+                    sql_dial: None,
+                    server_version: Some("8.0.11-TiDB-v7.5.0".to_owned()),
+                },
+            );
+            redirection.insert(id, true);
+        }
+        self.input
+            .deliver(MergedTopology { backends: merged }, health, redirection)
+    }
+
+    /// Applies a partial config and waits until topology observed it.
+    async fn patch(&mut self, toml: &str) {
+        use control_config::ConfigNamespaceSource as _;
+        self.revision += 1;
+        let Ok(_) = self.store.apply_toml(
+            toml.as_bytes(),
+            None,
+            self.revision,
+            &std::env::current_dir().unwrap_or_default(),
+        ) else {
+            unreachable!("tenant config patch applies")
+        };
+        let wanted = self.store.current().generation();
+        let mut status = self.topology.status();
+        assert!(
+            timeout(
+                Duration::from_secs(5),
+                status.wait_for(|status| status.observed_generation == wanted)
+            )
+            .await
+            .is_ok(),
+            "topology observed the patched config"
+        );
+    }
+
+    fn unsettled_redirects(&self) -> u64 {
+        self.handle.route_ledger_evidence().unsettled_redirects
+    }
+
+    /// Waits until the route plane reports exactly `count` unsettled
+    /// (accepted, not yet finished) redirects.
+    async fn wait_unsettled(&self, count: u64, what: &str) {
+        assert!(
+            timeout(Duration::from_secs(8), async {
+                while self.unsettled_redirects() != count {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .is_ok(),
+            "{what}: expected {count} unsettled redirect(s)"
+        );
+    }
+
+    async fn shutdown(self) {
+        self.topology_task.abort();
+        self.plane_task.abort();
+        let _ = self.topology_task.await;
+        let _ = self.plane_task.await;
+    }
+}
+
+/// The config store of the tenant fixture: a `keyspace-routing` `default`
+/// namespace, the `connection` policy, `balance.tenant-migration = true`, one
+/// backend cluster (dynamic topology), then `initial` at revision 2.
+fn tenant_store(initial: &str) -> Arc<control_config::ConfigNamespaceStore> {
+    use control_config::ConfigNamespaceStore;
+    let Ok(effective) = serde_json::from_str::<control_config::EffectiveConfig>(
+        r#"{"proxy":{"pd-addrs":""},"balance":{"policy":"connection","tenant-migration":true}}"#,
+    ) else {
+        unreachable!("tenant effective config")
+    };
+    let Ok(namespace) = control_config::source::decode_namespace(
+        "default",
+        br#"{"namespace":"default","keyspace-routing":true,"frontend":{},"backend":{}}"#,
+    ) else {
+        unreachable!("tenant namespace decodes")
+    };
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let Ok(store) = ConfigNamespaceStore::new(
+        effective,
+        vec![namespace],
+        control_config::SourceRevision::default(),
+        &cwd,
+    ) else {
+        unreachable!("namespace store")
+    };
+    let store = Arc::new(store);
+    // One backend cluster (matching `UnreachableClusterFactory`) selects
+    // discovered (dynamic) topology.
+    let Ok(_) = store.apply_toml(
+        b"[[proxy.backend-clusters]]\nname = \"default\"\npd-addrs = \"127.0.0.1:1\"\n",
+        None,
+        1,
+        &cwd,
+    ) else {
+        unreachable!("tenant backend cluster applies")
+    };
+    let Ok(_) = store.apply_toml(initial.as_bytes(), None, 2, &cwd) else {
+        unreachable!("initial tenant config applies")
+    };
+
+    store
+}
+
+/// A `keyspace-routing` namespace with the `connection` balance policy and
+/// `balance.tenant-migration = true`, `initial` applied on top, publishing
+/// `backends`, and a session owner on its local route path (with metering
+/// when `registry` is given).
+async fn spawn_tenant_stack(
+    backends: &[(u16, KeyspaceScope)],
+    initial: &str,
+    registry: Option<MeteringSourceRegistry>,
+) -> (Stack, TenantRoutePlane) {
+    use control_config::{HealthCheckConfig, TopologyRuntimeIdentity};
+    use control_plane::ControlModule;
+    use control_plane::{ControlConfig, ControlRuntime, LogLevel, MetricsPolicy, TlsPolicy};
+    use control_topology::{StaticAdvertiseResolver, TopologyModule};
+
+    let store = tenant_store(initial);
+    let registry_owner = control_plane::OwnershipRegistry::new();
+    let Ok(control_config) = ControlConfig::new(
+        1,
+        Duration::from_secs(30),
+        0,
+        TlsPolicy::default(),
+        LogLevel::Info,
+        MetricsPolicy::default(),
+    ) else {
+        unreachable!("control config")
+    };
+    let Ok(runtime) = ControlRuntime::claim_process(
+        &registry_owner,
+        "dataplane-tenant-route-fixture",
+        control_config,
+        Arc::new(SilentSink),
+    ) else {
+        unreachable!("claim process")
+    };
+    let source: Arc<dyn control_config::ConfigNamespaceSource> = store.clone();
+    let Ok((topology_module, mut topology_handle)) = TopologyModule::new(
+        Arc::clone(&source),
+        Box::new(UnreachableClusterFactory),
+        Arc::new(StaticAdvertiseResolver::new("127.0.0.1")),
+        TopologyRuntimeIdentity {
+            version: Arc::from("v-test"),
+            git_hash: Arc::from("hash-test"),
+            deploy_path: std::path::PathBuf::from("/deploy/test"),
+            start_timestamp: 1_700_000_000,
+        },
+        HealthCheckConfig {
+            enabled: false,
+            ..HealthCheckConfig::default()
+        },
+    ) else {
+        unreachable!("topology module")
+    };
+    // Discovery and health come from the replay input; config, namespace
+    // incarnation and ownership fences stay real.
+    let input =
+        topology_handle.replay_health_input(runtime.handle().module_context().owner().clone());
+    let (route_plane, mut plane_handle) =
+        control_router::RoutePlane::new(Arc::clone(&source), topology_handle.clone(), None);
+    let context = runtime.handle().module_context();
+    let plane_context = runtime.handle().module_context();
+    let Ok(()) = runtime.mark_ready() else {
+        unreachable!("runtime ready")
+    };
+    let topology_task = tokio::spawn(Box::new(topology_module).run(context));
+    assert!(
+        timeout(Duration::from_secs(5), topology_handle.wait_ready())
+            .await
+            .is_ok(),
+        "tenant topology ready"
+    );
+
+    let plane = TenantRoutePlane {
+        handle: plane_handle.clone(),
+        store,
+        topology: topology_handle,
+        input,
+        revision: 2,
+        _runtime: runtime,
+        topology_task,
+        plane_task: tokio::spawn(Box::new(route_plane).run(plane_context)),
+    };
+    plane.publish(backends).await;
+    assert!(
+        timeout(Duration::from_secs(5), plane_handle.wait_ready())
+            .await
+            .is_ok(),
+        "tenant route plane ready"
+    );
+    let stack = spawn_stack_configured_with_metering(
+        SnapshotReply::Valid,
+        false,
+        Duration::from_secs(5),
+        Duration::from_secs(60),
+        false,
+        None,
+        None,
+        Duration::from_secs(30),
+        registry,
+        Some(plane.handle.clone()),
+    )
+    .await;
+    (stack, plane)
+}
+
+fn fail_list(port: u16) -> String {
+    format!("[proxy]\nfail-backend-list = [\"127.0.0.1:{port}\"]\n")
+}
+
+async fn tenant_login(stack: &Stack, user: &[u8]) -> MysqlClient {
+    let Ok(Ok(client)) = timeout(
+        Duration::from_secs(5),
+        MysqlClient::login_user(stack.sql_port, user, FAKE_BACKEND_PASSWORD, None),
+    )
+    .await
+    else {
+        unreachable!("tenant session established")
+    };
+    client
+}
+
+fn attributions(registry: &MeteringSourceRegistry) -> Vec<(String, String)> {
+    let Ok(attributions) = registry.active_source_attributions() else {
+        unreachable!("metering source registry is available")
+    };
+    attributions
+}
+
+/// Queues a failover redirect of a `ksa` session from the shared source to
+/// the single-keyspace target while the client holds a transaction open, so
+/// the accepted redirect waits for the boundary.
+async fn queue_tenant_redirect() -> (
+    Stack,
+    TenantRoutePlane,
+    MysqlClient,
+    ConcurrentFakeBackend,
+    ConcurrentFakeBackend,
+) {
+    let source = spawn_concurrent_fake_backend(vec![BackendMode::Plain]).await;
+    let target = spawn_concurrent_fake_backend(vec![BackendMode::Plain]).await;
+    let (stack, mut plane) = spawn_tenant_stack(
+        &[
+            (source.port, tenants(&["ksa", "ksb"])),
+            (target.port, KeyspaceScope::Single("ksa".to_owned())),
+        ],
+        &fail_list(target.port),
+        None,
+    )
+    .await;
+    let mut client = tenant_login(&stack, b"ksa.app").await;
+    assert_eq!(source.accepted.load(Ordering::Relaxed), 1);
+    assert!(client.query_ok("BEGIN").await, "transaction open");
+    plane.patch(&fail_list(source.port)).await;
+    plane.wait_unsettled(1, "failover redirect accepted").await;
+    // Still held by the open transaction: nothing reached the target.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(target.accepted.load(Ordering::Relaxed), 0);
+    assert_eq!(plane.unsettled_redirects(), 1);
+    (stack, plane, client, source, target)
+}
+
+/// The refused execution: the redirect settles failed, the target never
+/// sees a connection, and the source keeps serving.
+async fn assert_refused_at_execution(
+    plane: &TenantRoutePlane,
+    client: &mut MysqlClient,
+    target: &ConcurrentFakeBackend,
+) {
+    plane.wait_unsettled(0, "queued redirect settled").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        target.accepted.load(Ordering::Relaxed),
+        0,
+        "no migration state or dial reached the target"
+    );
+    assert!(client.query_ok("SELECT source_still_serves").await);
+}
+
+#[tokio::test]
+async fn tenant_redirect_is_refused_when_change_user_switches_tenant_while_queued() {
+    let (stack, plane, mut client, source, target) = queue_tenant_redirect().await;
+    let attributes = [Attribute {
+        key: b"program_name",
+        value: b"tenant-switch",
+    }];
+    assert!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &attributes)
+            .await
+            .is_ok(),
+        "the backend accepts the change-user"
+    );
+    assert_refused_at_execution(&plane, &mut client, &target).await;
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    source.shutdown().await;
+    target.shutdown().await;
+}
+
+#[tokio::test]
+async fn tenant_redirect_is_refused_when_its_target_is_withdrawn_while_queued() {
+    let (stack, plane, mut client, source, target) = queue_tenant_redirect().await;
+    plane
+        .publish(&[(source.port, tenants(&["ksa", "ksb"]))])
+        .await;
+    assert!(client.query_ok("COMMIT").await, "transaction boundary");
+    assert_refused_at_execution(&plane, &mut client, &target).await;
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    source.shutdown().await;
+    target.shutdown().await;
+}
+
+#[tokio::test]
+async fn tenant_redirect_is_refused_when_the_gate_is_disabled_while_queued() {
+    let (stack, mut plane, mut client, source, target) = queue_tenant_redirect().await;
+    plane.patch("[balance]\ntenant-migration = false\n").await;
+    assert!(client.query_ok("COMMIT").await, "transaction boundary");
+    assert_refused_at_execution(&plane, &mut client, &target).await;
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    source.shutdown().await;
+    target.shutdown().await;
+}
+
+/// Moves one metered `ksa` session from `from` to `to` by failover and
+/// checks that metering follows it with the session keyspace.
+async fn metered_tenant_move(from: KeyspaceScope, to: KeyspaceScope) {
+    let Ok(registry) = MeteringSourceRegistry::new(11) else {
+        unreachable!("metering registry")
+    };
+    let source = spawn_concurrent_fake_backend(vec![BackendMode::Plain]).await;
+    let target = spawn_concurrent_fake_backend(vec![BackendMode::Plain]).await;
+    let (stack, mut plane) = spawn_tenant_stack(
+        &[(source.port, from), (target.port, to)],
+        &fail_list(target.port),
+        Some(registry.clone()),
+    )
+    .await;
+    let mut client = tenant_login(&stack, b"ksa.app").await;
+    assert_eq!(
+        attributions(&registry),
+        [(tenant_backend_id(source.port), "ksa".to_owned())],
+        "metering is attached to the session keyspace"
+    );
+    plane.patch(&fail_list(source.port)).await;
+    let moved = timeout(Duration::from_secs(8), async {
+        while target.accepted.load(Ordering::Relaxed) == 0 || plane.unsettled_redirects() != 0 {
+            assert!(client.query_ok("SELECT waiting_for_move").await);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(moved.is_ok(), "the tenant session migrated");
+    assert!(client.query_ok("SELECT on_target").await);
+    assert_eq!(
+        attributions(&registry),
+        [
+            (tenant_backend_id(source.port), "ksa".to_owned()),
+            (tenant_backend_id(target.port), "ksa".to_owned()),
+        ],
+        "old final and the new generation, both attributed to ksa"
+    );
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    source.shutdown().await;
+    target.shutdown().await;
+}
+
+#[tokio::test]
+async fn metered_tenant_session_moves_from_single_to_shared_backend() {
+    metered_tenant_move(
+        KeyspaceScope::Single("ksa".to_owned()),
+        tenants(&["ksa", "ksb"]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn metered_tenant_session_moves_from_shared_to_single_backend() {
+    metered_tenant_move(
+        tenants(&["ksa", "ksb"]),
+        KeyspaceScope::Single("ksa".to_owned()),
+    )
+    .await;
+}
+
+fn source_bytes(registry: &MeteringSourceRegistry) -> Vec<u64> {
+    let Ok(bytes) = registry.active_source_bytes() else {
+        unreachable!("metering source registry is available")
+    };
+    bytes
+}
+
+const CHANGE_USER_ATTRIBUTES: [Attribute<'static>; 1] = [Attribute {
+    key: b"program_name",
+    value: b"tenant-change-user",
+}];
+
+/// Spawns a tenant stack over one backend serving `serves`, with the
+/// tenant-migration gate as given, and logs in as `ksa.app`.
+async fn single_backend_tenant_session(
+    serves: KeyspaceScope,
+    gate: bool,
+    registry: Option<MeteringSourceRegistry>,
+) -> (Stack, TenantRoutePlane, ConcurrentFakeBackend, MysqlClient) {
+    let backend = spawn_concurrent_fake_backend(vec![BackendMode::Plain]).await;
+    let (stack, plane) = spawn_tenant_stack(
+        &[(backend.port, serves)],
+        &format!("[balance]\ntenant-migration = {gate}\n"),
+        registry,
+    )
+    .await;
+    let client = tenant_login(&stack, b"ksa.app").await;
+    (stack, plane, backend, client)
+}
+
+#[tokio::test]
+async fn metered_shared_session_refuses_change_user_to_another_tenant() {
+    let Ok(registry) = MeteringSourceRegistry::new(11) else {
+        unreachable!("metering registry")
+    };
+    // Migration disabled: admission alone meters the tenant session.
+    let (stack, plane, backend, mut client) =
+        single_backend_tenant_session(tenants(&["ksa", "ksb"]), false, Some(registry.clone()))
+            .await;
+    let source = tenant_backend_id(backend.port);
+    assert!(client.query_ok("SELECT as_ksa").await);
+    assert_eq!(
+        attributions(&registry),
+        [(source.clone(), "ksa".to_owned())]
+    );
+    let before = source_bytes(&registry);
+
+    assert_eq!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await,
+        Err(1045),
+        "a cross-tenant change-user is refused on a metered shared session"
+    );
+    assert_eq!(
+        source_bytes(&registry),
+        before,
+        "nothing of the refused change-user reached ksa's metered backend"
+    );
+    // The session continues as the verified ksa user, still billed to ksa.
+    assert!(client.query_ok("SELECT still_ksa").await);
+    assert_eq!(
+        attributions(&registry),
+        [(source.clone(), "ksa".to_owned())]
+    );
+    // The same tenant's other user is fine.
+    assert!(
+        client
+            .change_user(b"ksa.reporting", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await
+            .is_ok()
+    );
+    assert!(client.query_ok("SELECT as_ksa_reporting").await);
+    assert_eq!(attributions(&registry), [(source, "ksa".to_owned())]);
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn metered_single_keyspace_session_bills_its_backend_tenant_after_change_user() {
+    let Ok(registry) = MeteringSourceRegistry::new(11) else {
+        unreachable!("metering registry")
+    };
+    // A single-keyspace backend's own tenant decides attribution, so the
+    // change-user is not refused and billing stays with that backend.
+    let (stack, plane, backend, mut client) = single_backend_tenant_session(
+        KeyspaceScope::Single("ksa".to_owned()),
+        true,
+        Some(registry.clone()),
+    )
+    .await;
+    assert!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await
+            .is_ok()
+    );
+    assert!(client.query_ok("SELECT after_change_user").await);
+    assert_eq!(
+        attributions(&registry),
+        [(tenant_backend_id(backend.port), "ksa".to_owned())]
+    );
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn unmetered_shared_session_allows_change_user_to_another_tenant() {
+    let (stack, plane, backend, mut client) =
+        single_backend_tenant_session(tenants(&["ksa", "ksb"]), true, None).await;
+    assert!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await
+            .is_ok(),
+        "without attribution to protect, the router only stops vouching"
+    );
+    assert!(client.query_ok("SELECT as_ksb").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconnect_onto_a_now_shared_address_arms_the_billing_guard_at_the_swap() {
+    let Ok(registry) = MeteringSourceRegistry::new(11) else {
+        unreachable!("metering registry")
+    };
+    let (stack, plane, backend, mut client) = single_backend_tenant_session(
+        KeyspaceScope::Single("ksa".to_owned()),
+        true,
+        Some(registry.clone()),
+    )
+    .await;
+    let id = tenant_backend_id(backend.port);
+    assert!(client.query_ok("SELECT on_single").await);
+    // Discovery now describes the same address as serving ksa and ksb.
+    plane
+        .publish(&[(backend.port, tenants(&["ksa", "ksb"]))])
+        .await;
+    // Management reconnect-to-self moves the session onto a new socket to
+    // the (now shared) address.
+    let Ok(summary) = plane.handle.redirect_connections() else {
+        unreachable!("route plane is running")
+    };
+    assert_eq!(summary.accepted, 1, "reconnect-to-self accepted");
+    let reconnected = timeout(Duration::from_secs(8), async {
+        while backend.accepted.load(Ordering::Relaxed) < 2 || plane.unsettled_redirects() != 0 {
+            assert!(client.query_ok("SELECT waiting_for_reconnect").await);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(reconnected.is_ok(), "the reconnect completed");
+    assert_eq!(
+        attributions(&registry),
+        [
+            (id.clone(), "ksa".to_owned()),
+            (id.clone(), "ksa".to_owned())
+        ],
+        "the new socket still bills ksa"
+    );
+    // The new socket is billed by identity: the guard is armed on it.
+    let before = source_bytes(&registry);
+    assert_eq!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await,
+        Err(1045)
+    );
+    assert_eq!(source_bytes(&registry), before, "ksa's meter did not move");
+    assert!(client.query_ok("SELECT still_ksa").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn billing_disabled_allows_change_user_to_another_tenant() {
+    // The binary always attaches a registry; the provider setting decides.
+    let Ok(registry) = MeteringSourceRegistry::new(11) else {
+        unreachable!("metering registry")
+    };
+    let registry = registry.with_billing_enabled(false);
+    let (stack, plane, backend, mut client) =
+        single_backend_tenant_session(tenants(&["ksa", "ksb"]), false, Some(registry)).await;
+    assert!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await
+            .is_ok(),
+        "nothing is billed, so nothing is refused"
+    );
+    assert!(client.query_ok("SELECT as_ksb").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
 }

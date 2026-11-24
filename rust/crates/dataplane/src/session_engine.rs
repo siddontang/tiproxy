@@ -1296,6 +1296,13 @@ struct BackendIo {
     /// Whether the policy for `healthy` reached the raw socket. Failures are
     /// best-effort like Go and retried by the health ticker.
     keepalive_applied: bool,
+    /// The tenant THIS socket is billed to by the session's verified user
+    /// identity (a tenant session on a shared backend, where `keyspace` comes
+    /// from the session, not the backend); `None` when the backend's own
+    /// keyspace decides. Set when the socket is attached and installed with
+    /// it at every swap, together with its metering source, so billing guards
+    /// read the live connection rather than the router's routing record.
+    billing_tenant: Option<String>,
 }
 
 fn backend_health_in_snapshot(
@@ -2292,6 +2299,12 @@ impl Engine {
             local: backend_local,
             healthy: backend_healthy,
             keepalive_applied,
+            // Admission: the ledger records exactly the admitted backend's
+            // scope with the session keyspace.
+            billing_tenant: self
+                .local_route_lease
+                .as_ref()
+                .and_then(LocalRouteChannel::identity_attributed_keyspace),
         };
         // Backend responses are multi-packet result sets; over-read buffering
         // serves their physical packets from one transport read. The backend
@@ -3050,6 +3063,25 @@ impl Engine {
             let _ = self.events.send(SessionEvent::ClientIoError).await;
             return Some(WireErrorSource::Proxy);
         };
+        // A metered tenant session on a shared backend is billed to the
+        // keyspace of its verified user identity. Changing to another
+        // tenant's user there would leave billing either on a tenant the
+        // proxy no longer verifies or, if detached, unbilled. Refuse it
+        // locally, before anything reaches the backend; the session stays
+        // the tenant it is billed as.
+        if self
+            .metering
+            .as_ref()
+            .is_some_and(MeteringSourceRegistry::billing_enabled)
+            && let Some(tenant) = self
+                .backend
+                .as_ref()
+                .and_then(|backend| backend.billing_tenant.as_deref())
+            && control_router::user_keyspace(&String::from_utf8_lossy(plan.pending.username()))
+                != Some(tenant)
+        {
+            return self.refuse_cross_tenant_change_user().await;
+        }
         if let Err(source) = self.begin_change_user(&plan).await {
             return Some(source);
         }
@@ -3073,6 +3105,45 @@ impl Engine {
                 Err(source) => return Some(source),
             }
         }
+    }
+
+    /// Answers a refused cross-tenant `COM_CHANGE_USER` exactly like a
+    /// backend rejection (`ER_ACCESS_DENIED_ERROR`): the client gets the ERR,
+    /// the pending identity is discarded, and the command completes on the
+    /// unchanged session. Nothing is written to the backend.
+    async fn refuse_cross_tenant_change_user(&mut self) -> Option<WireErrorSource> {
+        let mut relay = ChangeUserRelay::new();
+        let Ok(step) = relay.on_event(ChangeUserEvent::BackendError { code: 1045 }) else {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(WireErrorSource::Proxy);
+        };
+        self.align_change_user_client_write();
+        if let Err(source) = self
+            .write_client_error(
+                1045,
+                *b"28000",
+                "Access denied: a metered session cannot change to another tenant's user",
+            )
+            .await
+        {
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Some(source);
+        }
+        let Some(event) = step.session_event else {
+            return Some(WireErrorSource::Proxy);
+        };
+        if self.events.send(event).await.is_err() {
+            return Some(WireErrorSource::Proxy);
+        }
+        let _round_permit = match self
+            .await_effect(SessionEffect::ForwardResponseToClient)
+            .await
+        {
+            EffectAck::Got(permit) => Some(permit),
+            EffectAck::Closing => None,
+        };
+        None
     }
 
     async fn begin_change_user(&mut self, plan: &ChangeUserPlan) -> Result<(), WireErrorSource> {
@@ -3166,6 +3237,14 @@ impl Engine {
                 return Err(WireErrorSource::Proxy);
             };
             identity.apply_change_user(&plan.pending);
+            // The router must not keep vouching for the admission keyspace
+            // once the backend accepted a user with another prefix: report
+            // the committed user, decoded as at admission, so migration
+            // falls back to the rule that never touches shared backends.
+            if let Some(lease) = &self.local_route_lease {
+                // Whether it was cleared only matters to the router's guard.
+                let _cleared = lease.change_user(&String::from_utf8_lossy(plan.pending.username()));
+            }
         }
         if successful {
             // This is the sole prepared-state clear seam: dispatch owns
@@ -4344,6 +4423,24 @@ impl Engine {
         // owner at the FSM safe boundary. MIG-01 consumes the validated
         // token/state only inside this task, builds a fully restored candidate,
         // and exposes it to the FSM only after the restore OK is consumed.
+        //
+        // An accepted redirect may have waited here for a transaction
+        // boundary while the session (COM_CHANGE_USER), discovery or the
+        // tenant-migration gate changed. Revalidate it with the session's
+        // router before any state is captured or the target is dialed; on
+        // refusal the old backend stays the untouched sole owner and
+        // nothing reaches the target.
+        let billing_tenant = match (&self.redirect_target, &self.local_route_lease) {
+            (Some(target), Some(lease)) => {
+                let Some(authority) = lease.revalidate_redirect(&target.backend_id) else {
+                    let _ = self.events.send(SessionEvent::RedirectBackendFailed).await;
+                    return;
+                };
+                authority.billing_tenant
+            }
+            // The compatibility bridge has no tenant-aware namespaces.
+            _ => None,
+        };
         match self.capture_migration_snapshot().await {
             Ok(snapshot) => {
                 if let Some(state) = self.cmd_state.as_mut() {
@@ -4367,7 +4464,10 @@ impl Engine {
                 )
                 .await;
                 match candidate {
-                    Ok(Ok(candidate)) => {
+                    Ok(Ok(mut candidate)) => {
+                        // Installed with the socket at the swap, atomically
+                        // with its metering source.
+                        candidate.billing_tenant = billing_tenant;
                         self.candidate = Some(candidate);
                         let _ = self.events.send(SessionEvent::RedirectBackendReady).await;
                     }
@@ -4504,6 +4604,8 @@ impl Engine {
             local: target.backend_local,
             healthy: target.backend_healthy,
             keepalive_applied: false,
+            // Set by the caller from the execution authority.
+            billing_tenant: None,
         };
         // Same read-side over-read buffering as the primary connect path.
         candidate.backend_io.enable_read_buffering();

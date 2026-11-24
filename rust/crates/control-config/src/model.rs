@@ -213,6 +213,11 @@ const FIELD_CONTRACT: &[FieldContract] = &[
         effect: FieldEffect::Applied,
     },
     FieldContract {
+        field: "balance.tenant-migration",
+        reload: ReloadClass::Dynamic,
+        effect: FieldEffect::Applied,
+    },
+    FieldContract {
         field: "enable-traffic-replay",
         reload: ReloadClass::Dynamic,
         effect: FieldEffect::Inert,
@@ -484,6 +489,13 @@ pub struct RoutingConfig {
     pub failed_backends: Arc<[Arc<str>]>,
     /// Grace period before sessions left on a failed backend are force-closed.
     pub failover_timeout_seconds: u64,
+    /// `balance.tenant-migration`: whether sessions in a `keyspace-routing`
+    /// namespace may be redirected at all. Off by default, which disables
+    /// every redirect there. When on, the target must serve the session's
+    /// tenant by its current discovery scope, including multi-keyspace
+    /// (shared) backends for a session with a keyspace. Legacy namespaces
+    /// ignore it.
+    pub tenant_migration: bool,
 }
 
 /// CP-ROUTE's immutable projection of one namespace generation.
@@ -960,6 +972,7 @@ impl EffectiveConfig {
                     .collect::<Vec<_>>(),
             ),
             failover_timeout_seconds,
+            tenant_migration: self.balance.tenant_migration,
         })
     }
 
@@ -1280,6 +1293,8 @@ impl EffectiveConfig {
             output.string(1, "routing-rule", &self.balance.routing_rule);
             output.string(1, "policy", &self.balance.policy);
             output.string(1, "routing-policy", &self.balance.routing_policy);
+            // Go encodes plain keys before sub-tables, whatever the field order.
+            output.boolean(1, "tenant-migration", self.balance.tenant_migration);
             output.factor("balance.status", self.balance.status);
             output.factor("balance.health", self.balance.health);
             output.factor("balance.memory", self.balance.memory);
@@ -2102,6 +2117,9 @@ struct BalanceConfig {
     routing_rule: String,
     policy: String,
     routing_policy: String,
+    /// Go `Balance.TenantMigration`; see
+    /// [`RoutingConfig::tenant_migration`].
+    tenant_migration: bool,
     status: FactorConfig,
     health: FactorConfig,
     memory: FactorConfig,
@@ -2117,6 +2135,7 @@ impl Default for BalanceConfig {
             routing_rule: String::new(),
             policy: "resource".to_owned(),
             routing_policy: "prefer-idle".to_owned(),
+            tenant_migration: false,
             status: FactorConfig::default(),
             health: FactorConfig::default(),
             memory: FactorConfig::default(),
@@ -2133,6 +2152,7 @@ impl BalanceConfig {
             && self.routing_rule.is_empty()
             && self.policy.is_empty()
             && self.routing_policy.is_empty()
+            && !self.tenant_migration
             && self.status.migrations_per_second == 0.0
             && self.health.migrations_per_second == 0.0
             && self.memory.migrations_per_second == 0.0
@@ -2240,6 +2260,13 @@ impl fmt::Debug for MeteringConfig {
 }
 
 impl MeteringConfig {
+    /// Whether usage is billed: a provider and a bucket are configured. The
+    /// native meter otherwise runs its disabled (non-exporting) mode.
+    #[must_use]
+    pub fn billing_enabled(&self) -> bool {
+        !self.provider_type.is_empty() && !self.bucket.is_empty()
+    }
+
     fn is_zero(&self) -> bool {
         self.provider_type.is_empty()
             && self.region.is_empty()

@@ -230,6 +230,7 @@ would activate the value is rejected by the serving validator.
 | `rsa-key-size`, `autocert-expire-duration` below every global TLS block | Dynamic, inert unless auto-certs | Canonically round-tripped; because auto-certs is unsupported, these fields do not generate material in #146. |
 | `log.level`, every `filename`, `max-size`, `max-days`, `max-backups` below `log.log-file` | Dynamic | Level is applied by CP-001; file sink changes are retained for CP-ADMIN/log ownership. |
 | `balance.label-name`, `.policy`, `.routing-policy`; `migrations-per-second` below `.status`, `.health`, `.memory`, `.cpu`, `.location`, `.conn-count`; `.conn-count.count-ratio-threshold` | Dynamic | Validated and retained for CP-ROUTE. |
+| `balance.tenant-migration` | Dynamic | Default `false` (omitted from the canonical output, like Go `omitempty`). Applies only to namespaces with `keyspace-routing = true`; see that setting below. Inert in the Go router, which has no tenant-aware namespaces. Keep it off until `TiDB` binds the session token to its tenant. |
 | every `labels.<key>` | Dynamic | Stable map projection for CP-TOPO/CP-ROUTE. |
 | `enable-traffic-replay` | Dynamic, inert | The Go default `true` is accepted and SQL serving starts. Capture and replay are not implemented: the traffic API answers `unsupported` when the flag is true and `disabled` when it is false. `rust-dataplane.enabled` together with this flag still fails `Config.Check`. |
 
@@ -240,7 +241,7 @@ Namespace values have a separate, equally exact classification:
 | `namespace`, `frontend.user` | Dynamic | CP-CFG persists identity and publishes immutable generations; CP-ROUTE owns listener/user binding and conflicts. |
 | every TLS field below `frontend.security` and `backend.security` | Dynamic, with auto-certs unsupported as above | CP-CFG validates and content-watches material; CP-ROUTE consumes it for new sessions. |
 | every entry in `backend.instances` | Dynamic | CP-CFG persists and orders it; CP-ROUTE owns backend binding. |
-| `keyspace-routing` (Rust-only, default `false`) | Dynamic, new router incarnation | Part of the CP-ROUTE namespace projection, so a change replaces the namespace router; existing sessions keep their router. While `true`, session redirects (direct, balance/failover-driven and management reconnect-to-self) are disabled for the namespace until shared/tenant migration lands. |
+| `keyspace-routing` (Rust-only, default `false`) | Dynamic, new router incarnation | Part of the CP-ROUTE namespace projection, so a change replaces the namespace router; existing sessions keep their router. While `true`, session redirects (direct, balance/failover-driven and management reconnect-to-self) are disabled for the namespace unless `balance.tenant-migration` is on; see below. |
 
 There is deliberately no namespace `keyspace` field. CP-TOPO discovers
 keyspaces and CP-ROUTE #147 binds them to sessions; #146 neither invents nor
@@ -264,8 +265,67 @@ no longer matches the Go namespace checksum.
   liveness fallback (no `info` with its own-path `ttl`) have an unverified
   tenant and serve no prefixed login. No session in such a namespace is
   redirected (direct, balance/failover-driven or management
-  reconnect-to-self) until shared/tenant migration lands; tenant-aware
-  checks compare discovery scopes, never `keyspace` labels.
+  reconnect-to-self) while `balance.tenant-migration` is `false` (default).
+
+With `balance.tenant-migration = true`, every redirect path in a
+`keyspace-routing` namespace checks the tenant against the routing snapshot
+the decision is made against: the source and the target must have records in
+it (a withdrawn address kept for its open sessions has none; the management
+reconnect captures and applies a fresh snapshot first), and the check compares
+discovery scopes (single-keyspace path, allow-list, `"*"`), never `keyspace`
+labels or the assignment keyspace derived from them.
+
+- The session keyspace is the `<keyspace>.` prefix of the handshake user,
+  recorded when the namespace routed the login by it. The backend
+  authenticates exactly that user. A successful `COM_CHANGE_USER` to a user
+  with another prefix, or none, clears it for the rest of the session (fail
+  closed: which tenant a cross-prefix change-user lands in is up to the
+  backend); the same prefix keeps it.
+- A session with a keyspace may be redirected when its recorded scope and
+  its current source serve the keyspace, and only to a target that serves it
+  (single-keyspace equal, allow-list containing it, or `"*"`; never an
+  unverified record). This allows multi-keyspace <-> single-keyspace moves
+  within a tenant and refuses cross-tenant moves. It is the only case where
+  a session admitted on a shared backend may move.
+- Any other session (unprefixed login, rehydrated, or cleared by
+  change-user) may move only within the verified single keyspace it was
+  admitted on, and only while its current source is still that keyspace; a
+  session admitted on a shared or unverified record stays pinned.
+- An accepted redirect can wait for a transaction boundary. Right before the
+  session engine captures session state and dials the target, it revalidates
+  the redirect with the router against a fresh snapshot: the gate is still
+  on, the session keyspace (after any change-user) still qualifies, and the
+  target is still a current, verified record serving it. On refusal the
+  redirect fails without any I/O to the target and the session keeps its
+  source backend.
+- A successful move records, as the session's scope, the target scope that
+  authorized that execution, never a record learned later (a destination
+  relabelled during the handshake does not become the session's tenant). A
+  reconnect to the same backend keeps the recorded scope.
+- Balancing and failover plan backend pairs whose verified scopes share a
+  tenant (shared and single-keyspace backends included); every offer of the
+  pair re-checks its own session as above. A session that is merely
+  ineligible for the pair (another tenant on an overlapping source, a pinned
+  session) is skipped without starting a failure cooldown or counting a
+  refusal, so the failover timeout still closes it at the operator's
+  deadline.
+- Metering (design K4, brought forward for tenant sessions only): a tenant
+  session on a shared backend is attributed to its session keyspace, at
+  admission and when it moves onto one, instead of the empty keyspace that
+  detaches metering. Every other assignment keeps its keyspace. The billing
+  tenant belongs to the backend connection: it is set when a socket is
+  attached (admission) or opened by a redirect, from the scope verified for
+  that socket at that moment (including a reconnect to an address that has
+  since become shared), and installed together with the socket's metering
+  source at the swap. While billing is enabled (`metering.type` and
+  `metering.bucket` set; the metering registry is attached either way) and the
+  live connection is billed by identity, a `COM_CHANGE_USER` to another
+  tenant's user is refused with `1045`/`28000` before it reaches the backend,
+  so the session stays the tenant it is billed as; detaching would leave the
+  new tenant unbilled, and re-attributing would bill the old tenant's history
+  to it. On a single-keyspace backend the backend's own tenant stays the
+  billed keyspace, so the change-user is allowed. This holds whether or not
+  `balance.tenant-migration` is on.
 
 Example `/config/ns/tenants` value:
 

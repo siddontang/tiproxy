@@ -80,12 +80,104 @@ pub(crate) fn admission_filter<'a>(
     }
 }
 
-/// PR 1 gate for redirects in `keyspace-routing = true` namespaces: every
-/// redirect (direct, balance/failover-driven, management reconnect-to-self)
-/// is refused there until shared/tenant migration is qualified end to end
-/// (K3). The per-session admission scope and the authoritative-scope checks
-/// below stay in place so K3 only has to open this gate.
-pub(crate) const TENANT_REDIRECTS_ENABLED: bool = false;
+impl<'a> KeyspaceFilter<'a> {
+    /// The keyspace an admission under this rule records as the session
+    /// keyspace: only a `<keyspace>.<user>` login in a `keyspace-routing`
+    /// namespace has one. A legacy namespace never treats a user-name prefix
+    /// as a keyspace (it need not be one there).
+    pub(crate) const fn session_keyspace(self) -> Option<&'a str> {
+        match self {
+            Self::Keyspace(keyspace) => Some(keyspace),
+            Self::Legacy | Self::Unprefixed => None,
+        }
+    }
+}
+
+/// The record `backend_id` has in the current routing snapshot, if any.
+///
+/// Tenant-aware redirect checks read scopes from here, never from the
+/// router's retained backend state, which keeps a withdrawn address's last
+/// record while sessions still own it.
+pub(crate) fn current_record<'a>(
+    backends: &'a [MergedBackend],
+    backend_id: &str,
+) -> Option<&'a MergedBackend> {
+    backends
+        .iter()
+        .find(|backend| backend.backend_id.as_ref() == backend_id)
+}
+
+/// The session side of the tenant rule for a redirect in a `keyspace-routing`
+/// namespace with `balance.tenant-migration` on: whether a session admitted
+/// on (or last moved onto) `admitted`, now owned by the current record
+/// `owner`, may be moved or reconnected at all.
+///
+/// - A session with a keyspace (design 5.7 K3): `admitted` and `owner` must
+///   serve it. A shared backend serving it qualifies; this is the only pin
+///   the flag relaxes. An `Unverified` record serves no keyspace.
+/// - A session without one: `admitted` must be a verified single keyspace and
+///   `owner` must still be exactly that one, as in PR 1.
+pub(crate) fn session_on_tenant(
+    keyspace: Option<&str>,
+    admitted: &KeyspaceScope,
+    owner: &MergedBackend,
+) -> bool {
+    match keyspace {
+        Some(keyspace) => admitted.serves(keyspace) && owner.backend.serves.serves(keyspace),
+        None => matches!(admitted, KeyspaceScope::Single(tenant) if verified_tenant(owner, tenant)),
+    }
+}
+
+/// Which tenant rule a redirect target is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TenantRule<'a> {
+    /// One session's redirect, with its session keyspace if it has one; see
+    /// [`tenant_target`].
+    Session(Option<&'a str>),
+    /// Balance/failover pair planning, which is per backend, not per
+    /// session: see [`tenant_pair`]. Every offer of the pair re-checks its
+    /// session with [`TenantRule::Session`].
+    Pair,
+}
+
+/// Whether balance may plan a `source` -> `target` pair at all: both
+/// verified (never `Unverified`) and sharing at least one tenant by
+/// discovery scope. Without this, a pair involving a shared backend could
+/// never be planned and tenant sessions could never be moved between
+/// single-keyspace and shared backends by balance or failover.
+pub(crate) fn tenant_pair(source: &MergedBackend, target: &MergedBackend) -> bool {
+    use KeyspaceScope::{Any, Set, Single, Unverified};
+    match (&source.backend.serves, &target.backend.serves) {
+        (Unverified(_), _) | (_, Unverified(_)) => false,
+        (Single(tenant), other) | (other, Single(tenant)) => other.serves(tenant),
+        (Set(left), Set(right)) => !left.is_disjoint(right),
+        (Any, Set(tenants)) | (Set(tenants), Any) => !tenants.is_empty(),
+        (Any, Any) => true,
+    }
+}
+
+/// The target side of the same rule, on the current records of the source
+/// and the target.
+///
+/// - With a session keyspace: both must serve it (`Single` equal, `Set`
+///   containing it, or `Any`), whether either is shared, so multi-keyspace
+///   <-> single-keyspace moves within the tenant are allowed and
+///   cross-tenant moves refused.
+/// - Without one (including balance pair planning): both must be the same
+///   verified single keyspace.
+pub(crate) fn tenant_target(
+    keyspace: Option<&str>,
+    source: &MergedBackend,
+    target: &MergedBackend,
+) -> bool {
+    match keyspace {
+        Some(keyspace) => {
+            source.backend.serves.serves(keyspace) && target.backend.serves.serves(keyspace)
+        }
+        None => matches!(&source.backend.serves, KeyspaceScope::Single(tenant)
+            if verified_tenant(target, tenant)),
+    }
+}
 
 /// Whether `backend`'s authoritative discovery scope is the verified single
 /// keyspace `tenant`. Tenant-aware code compares this scope (`serves`), never
@@ -155,6 +247,106 @@ mod tests {
             backend("c:1", KeyspaceScope::Single("ks1".into())),
             backend("d:1", KeyspaceScope::default()),
         ]
+    }
+
+    #[test]
+    fn only_a_keyspace_routed_prefix_is_a_session_keyspace() {
+        assert_eq!(
+            KeyspaceFilter::Keyspace("ks1").session_keyspace(),
+            Some("ks1")
+        );
+        assert_eq!(KeyspaceFilter::Unprefixed.session_keyspace(), None);
+        assert_eq!(KeyspaceFilter::Legacy.session_keyspace(), None);
+    }
+
+    #[test]
+    fn tenant_rule_compares_discovery_scopes() {
+        use super::{session_on_tenant, tenant_target};
+        let shared_ab = backend("a:1", set(&["ksa", "ksb"]));
+        let single_a = backend("b:1", KeyspaceScope::Single("ksa".into()));
+        let single_b = backend("c:1", KeyspaceScope::Single("ksb".into()));
+        let any = backend("d:1", KeyspaceScope::Any);
+        let unverified = backend("e:1", KeyspaceScope::Unverified("ksa".into()));
+        // With a session keyspace: serving is enough, shared or not.
+        for target in [&single_a, &shared_ab, &any] {
+            assert!(tenant_target(Some("ksa"), &shared_ab, target));
+        }
+        for target in [&single_b, &unverified] {
+            assert!(!tenant_target(Some("ksa"), &shared_ab, target));
+        }
+        assert!(session_on_tenant(
+            Some("ksa"),
+            &shared_ab.backend.serves,
+            &shared_ab
+        ));
+        assert!(!session_on_tenant(
+            Some("ksa"),
+            &unverified.backend.serves,
+            &single_a
+        ));
+        assert!(!session_on_tenant(
+            Some("ksa"),
+            &single_a.backend.serves,
+            &single_b
+        ));
+        // Without one: the verified single keyspace only.
+        assert!(tenant_target(None, &single_a, &single_a));
+        for target in [&shared_ab, &any, &unverified, &single_b] {
+            assert!(!tenant_target(None, &single_a, target));
+        }
+        assert!(!tenant_target(None, &shared_ab, &shared_ab));
+        assert!(session_on_tenant(None, &single_a.backend.serves, &single_a));
+        assert!(!session_on_tenant(
+            None,
+            &shared_ab.backend.serves,
+            &shared_ab
+        ));
+        assert!(!session_on_tenant(
+            None,
+            &single_a.backend.serves,
+            &unverified
+        ));
+    }
+
+    #[test]
+    fn balance_pairs_need_a_shared_verified_tenant() {
+        use super::tenant_pair;
+        let single_a = backend("a:1", KeyspaceScope::Single("ksa".into()));
+        let single_b = backend("b:1", KeyspaceScope::Single("ksb".into()));
+        let shared_ab = backend("c:1", set(&["ksa", "ksb"]));
+        let shared_c = backend("d:1", set(&["ksc"]));
+        let any = backend("e:1", KeyspaceScope::Any);
+        let unverified = backend("f:1", KeyspaceScope::Unverified("ksa".into()));
+        let empty = backend("g:1", KeyspaceScope::Set(BTreeSet::new()));
+        for (from, to) in [
+            (&single_a, &single_a),
+            (&single_a, &shared_ab),
+            (&shared_ab, &single_b),
+            (&shared_ab, &any),
+            (&any, &single_a),
+            (&any, &any),
+        ] {
+            assert!(
+                tenant_pair(from, to),
+                "{:?} -> {:?}",
+                from.backend.serves,
+                to.backend.serves
+            );
+        }
+        for (from, to) in [
+            (&single_a, &single_b),
+            (&shared_ab, &shared_c),
+            (&single_a, &unverified),
+            (&unverified, &single_a),
+            (&any, &empty),
+        ] {
+            assert!(
+                !tenant_pair(from, to),
+                "{:?} -> {:?}",
+                from.backend.serves,
+                to.backend.serves
+            );
+        }
     }
 
     #[test]

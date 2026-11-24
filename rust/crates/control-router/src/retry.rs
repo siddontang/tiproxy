@@ -50,6 +50,27 @@ impl Selector {
         &self.session
     }
 
+    /// Records a successful `COM_CHANGE_USER` to `user` on this session; see
+    /// [`Router::change_user`]. Returns whether the session keyspace was
+    /// cleared.
+    #[must_use = "callers may log or count a cleared session keyspace"]
+    pub fn change_user(&self, user: &str) -> bool {
+        self.router.change_user(&self.session, user)
+    }
+
+    /// See [`Router::identity_attributed_keyspace`].
+    #[must_use]
+    pub fn identity_attributed_keyspace(&self) -> Option<String> {
+        self.router.identity_attributed_keyspace(&self.session)
+    }
+
+    /// Revalidates this session's accepted redirect to `target_id` right
+    /// before execution; see [`Router::revalidate_redirect`].
+    #[must_use = "a refused redirect must not be executed"]
+    pub fn revalidate_redirect(&self, target_id: &str) -> Option<crate::ExecutionAuthority> {
+        self.router.revalidate_redirect(&self.session, target_id)
+    }
+
     /// Binds the client-selected keyspace for every attempt of this cycle.
     pub(crate) fn set_keyspace(&mut self, keyspace: Option<&str>) {
         self.keyspace = keyspace.map(Arc::from);

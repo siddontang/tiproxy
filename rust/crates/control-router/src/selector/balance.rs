@@ -105,6 +105,9 @@ impl Router {
                         candidate,
                         &pair.to,
                         self.sources.keyspace_routing(),
+                        // Pairs are planned per backend, not per session;
+                        // each offer re-checks its session's tenant.
+                        crate::keyspace::TenantRule::Pair,
                     )?;
                     let redirects = state
                         .ledger

@@ -658,7 +658,11 @@ async fn run(options: Options) -> Result<(), String> {
         Err(error) => return Err(guard.rollback(format!("open metering WAL: {error}")).await),
     };
     let metering = match MeteringSourceRegistry::new(ledger.process_generation()) {
-        Ok(registry) => registry,
+        // Billing-integrity guards (the cross-tenant change-user refusal)
+        // follow the effective provider setting, not the registry's presence.
+        Ok(registry) => {
+            registry.with_billing_enabled(meter_config.effective().metering().billing_enabled())
+        }
         Err(error) => {
             return Err(guard
                 .rollback(format!("create metering registry: {error}"))

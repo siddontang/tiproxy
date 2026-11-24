@@ -391,6 +391,9 @@ pub struct MeteringSourceRegistry {
     retired_totals: Arc<Mutex<BTreeMap<u64, (u64, u64)>>>,
     closed_connections: Arc<Mutex<BTreeSet<u64>>>,
     failed: Arc<AtomicBool>,
+    /// Whether the configured provider bills usage (restart-pinned). Sources
+    /// are sampled either way; only billing-integrity guards depend on it.
+    billing_enabled: bool,
 }
 
 /// Registry/sampler failure. Every variant is fail closed.
@@ -440,7 +443,23 @@ impl MeteringSourceRegistry {
             retired_totals: Arc::new(Mutex::new(BTreeMap::new())),
             closed_connections: Arc::new(Mutex::new(BTreeSet::new())),
             failed: Arc::new(AtomicBool::new(false)),
+            billing_enabled: true,
         })
+    }
+
+    /// Records whether the configured metering provider bills usage
+    /// (`metering.type` and `metering.bucket` set). A new registry assumes it
+    /// does; the process owner sets the effective value at startup.
+    #[must_use]
+    pub const fn with_billing_enabled(mut self, enabled: bool) -> Self {
+        self.billing_enabled = enabled;
+        self
+    }
+
+    /// Whether the configured metering provider bills usage.
+    #[must_use]
+    pub const fn billing_enabled(&self) -> bool {
+        self.billing_enabled
     }
 
     /// Marks an invariant/durability dependency failure observed on a SQL
@@ -462,6 +481,56 @@ impl MeteringSourceRegistry {
         self.sources
             .lock()
             .map(|sources| sources.len())
+            .map_err(|_| MeteringSamplerError::RegistryPoisoned)
+    }
+
+    /// Returns `(backend_id, keyspace)` of every source generation still owned
+    /// by the sampler, in `(connection, backend generation)` order. Like
+    /// [`Self::active_source_count`], a diagnostic/testing surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns when registry ownership was poisoned.
+    pub fn active_source_attributions(
+        &self,
+    ) -> Result<Vec<(String, String)>, MeteringSamplerError> {
+        self.sources
+            .lock()
+            .map(|sources| {
+                sources
+                    .values()
+                    .map(|source| {
+                        (
+                            source.attribution.backend_id.clone(),
+                            source.attribution.keyspace.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|_| MeteringSamplerError::RegistryPoisoned)
+    }
+
+    /// Returns the current raw byte count (inbound + outbound) of every source
+    /// generation still owned by the sampler, in the order of
+    /// [`Self::active_source_attributions`]. A diagnostic/testing surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns when registry ownership was poisoned.
+    pub fn active_source_bytes(&self) -> Result<Vec<u64>, MeteringSamplerError> {
+        self.sources
+            .lock()
+            .map(|sources| {
+                sources
+                    .values()
+                    .map(|source| {
+                        let (inbound, outbound) = source
+                            .final_values
+                            .unwrap_or((source.counters.inbound(), source.counters.outbound()));
+                        inbound.saturating_add(outbound)
+                    })
+                    .collect()
+            })
             .map_err(|_| MeteringSamplerError::RegistryPoisoned)
     }
 
