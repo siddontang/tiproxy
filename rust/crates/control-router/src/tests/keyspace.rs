@@ -496,3 +496,42 @@ fn shared_backend_assignment_has_no_single_keyspace() {
     ));
     assert_eq!(single, "label");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_follows_tenant_between_existing_addresses() -> TestResult {
+    let records = |left, right| {
+        [
+            (
+                PROCESS,
+                "127.0.0.1:4000",
+                shared(&serde_json::json!([left])),
+            ),
+            (
+                PROCESS,
+                "127.0.0.1:4001",
+                shared(&serde_json::json!([right])),
+            ),
+        ]
+    };
+    let (h, first) = harness_with(&records("a", "b"), 2).await?;
+    let mut selector = must(h.router.selector());
+    selector.set_keyspace(Some("a"));
+    let before = must(selector.next_candidate(&first, ClientInfo::default(), ""));
+    assert_eq!(before.assignment().backend_address, "127.0.0.1:4000");
+    assert_eq!(selector.finish(&before, false), Settlement::Applied);
+
+    // Neither address changes. Only the two process allow-lists change.
+    h.fixture.info_records(&records("b", "b"));
+    let withdrawn = published(&h, &first, 2).await;
+    assert!(matches!(
+        selector.next_candidate(&withdrawn, ClientInfo::default(), ""),
+        Err(RouteError::KeyspaceNotServed)
+    ));
+
+    h.fixture.info_records(&records("b", "a"));
+    let restored = published(&h, &withdrawn, 2).await;
+    let after = must(selector.next_candidate(&restored, ClientInfo::default(), ""));
+    assert_eq!(after.assignment().backend_address, "127.0.0.1:4001");
+    assert_eq!(selector.finish(&after, false), Settlement::Applied);
+    Ok(())
+}

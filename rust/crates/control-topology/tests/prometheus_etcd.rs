@@ -355,3 +355,50 @@ async fn poll_prometheus_reads_the_first_record_over_the_real_prefix_range() {
         unreachable!("the live prefix read completes well within the deadline");
     }
 }
+
+#[tokio::test]
+async fn topology_poll_includes_cold_tenants_and_legacy_members() {
+    let entries = vec![
+        kv(
+            "/topology/tidb/shared:4000/info",
+            r#"{"multi_keyspace":true,"keyspaces":["hot","cold"]}"#,
+        ),
+        kv("/topology/tidb/shared:4000/ttl", "1"),
+        kv(
+            "/keyspaces/tidb/legacy/topology/tidb/dedicated:4000/info",
+            "{}",
+        ),
+        kv(
+            "/keyspaces/tidb/legacy/topology/tidb/dedicated:4000/ttl",
+            "1",
+        ),
+        kv(
+            "/topology/tidb/expired:4000/info",
+            r#"{"multi_keyspace":true,"keyspaces":"*"}"#,
+        ),
+    ];
+    let Some((addr, _)) = spawn_fixture(entries).await else {
+        unreachable!("fixture must bind")
+    };
+    let Some((_registry, _lease, mut connection)) = connect(addr).await else {
+        unreachable!("fixture must accept a real etcd connection")
+    };
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        control_topology::poll_tidb_topology(&mut connection),
+    )
+    .await;
+    let Ok(Ok(snapshot)) = result else {
+        unreachable!("topology read failed: {result:?}")
+    };
+    let [dedicated, shared] = snapshot.backends.as_slice() else {
+        unreachable!("expected exactly two live backends: {snapshot:?}")
+    };
+    assert_eq!(dedicated.addr, "dedicated:4000");
+    assert!(dedicated.serves.serves("legacy"));
+    assert!(!dedicated.serves.serves("cold"));
+    assert_eq!(shared.addr, "shared:4000");
+    assert!(shared.serves.serves("hot"));
+    assert!(shared.serves.serves("cold"));
+    assert!(!shared.serves.serves("legacy"));
+}
