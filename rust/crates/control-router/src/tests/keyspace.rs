@@ -1807,3 +1807,120 @@ async fn k3_tenant_sessions_on_shared_backends_meter_their_keyspace() -> TestRes
     sim.router().close(&tenant);
     Ok(())
 }
+
+/// A fail-listable `Set{ksa,ksb}` source and a healthy `Single(ksa)`
+/// destination: their scopes overlap (ksa), so balance plans the pair.
+fn overlap_records() -> Vec<(&'static str, &'static str, serde_json::Value)> {
+    vec![
+        (
+            PROCESS,
+            "127.0.0.1:4000",
+            shared(&serde_json::json!(["ksa", "ksb"])),
+        ),
+        (KSA_PATH, "127.0.0.1:4003", classic()),
+    ]
+}
+
+fn summed_progress(sim: &MigrationSimulation) -> crate::MigrationProgress {
+    sim.progress()
+        .into_values()
+        .fold(crate::MigrationProgress::default(), |mut sum, progress| {
+            sum.keyspace_refusals += progress.keyspace_refusals;
+            sum.closes += progress.closes;
+            sum
+        })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k3_ineligible_sessions_of_an_overlapping_pair_are_skipped_quietly() -> TestResult {
+    let (h, _) = harness_with(&overlap_records(), 2, true).await?;
+    let sim = simulation(&h);
+    sim_ready(&sim, 2).await;
+    let on = tenant_migration_with(&h, &sim, true, 3, 2).await;
+    // Connection imbalance: every session is ksb's, none may go to ksa.
+    let sessions: Vec<_> = (0..6)
+        .map(|_| active_in(&sim, &on, SHARED_AB, Some("ksb")))
+        .collect();
+    let plan = must(sim.prepare_balance(&on, ClientInfo::default(), ""))
+        .ok_or("fixture: the overlapping pair is planned")?;
+    assert_eq!(plan.redirects().len(), sessions.len());
+
+    let (_stop_tx, stop) = watch::channel(false);
+    let start = Instant::now();
+    for step in 0..50_u64 {
+        let now = start + Duration::from_millis(100 * step);
+        let wall = i64::try_from(step).unwrap_or(i64::MAX) * 100_000_000 + 1;
+        must(sim.round_at(&on, true, &stop, now, now, wall));
+    }
+    assert!(sim.take_command().is_none(), "no redirect, no close");
+    assert_eq!(active(&sim, SHARED_AB), 6, "the sessions keep their source");
+    assert_eq!(
+        summed_progress(&sim).keyspace_refusals,
+        0,
+        "ineligible sessions are skipped, not refused on every pass"
+    );
+    // Not cooling down either: an eligible move is offered at once.
+    let ksa = active_in(&sim, &on, SHARED_AB, Some("ksa"));
+    migrate(&sim, &must(sim.prepare(&ksa, &on, SINGLE_A)), SINGLE_A);
+    for session in sessions.into_iter().chain([ksa]) {
+        sim.router().close(&session);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn k3_ineligible_session_on_a_failed_source_closes_at_the_failover_deadline() -> TestResult {
+    let (h, _) = harness_with(&overlap_records(), 2, true).await?;
+    let sim = simulation(&h);
+    sim_ready(&sim, 2).await;
+    let on = tenant_migration_with(&h, &sim, true, 3, 2).await;
+    let ksb = active_in(&sim, &on, SHARED_AB, Some("ksb"));
+    h.patch(
+        "[proxy]\nfail-backend-list = [\"127.0.0.1:4000\"]\nfailover-timeout = 1\n",
+        4,
+    );
+    h.source.deliver();
+    h.applied().await;
+    let failed = must(
+        tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let Ok(candidate) = sim.router().capture()
+                    && !Arc::ptr_eq(&candidate.config, &on.config)
+                {
+                    break candidate;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await,
+    );
+    let start = Instant::now();
+    must(sim.router().refresh_failover(&failed, start));
+    let (_stop_tx, stop) = watch::channel(false);
+    let mut closed_at = None;
+    for step in 0..50_u64 {
+        let now = start + Duration::from_millis(100 * step);
+        let wall = i64::try_from(step).unwrap_or(i64::MAX) * 100_000_000 + 1;
+        must(sim.round_at(&failed, true, &stop, now, now, wall));
+        match sim.take_command() {
+            None => {}
+            Some(crate::MigrationCommand::ForceClose(close)) => {
+                assert_eq!(sim.observe_close(&close), Settlement::Applied);
+                closed_at = Some(now.saturating_duration_since(start));
+                break;
+            }
+            Some(crate::MigrationCommand::Redirect(_)) => {
+                return Err("a ksb session must never be moved to ksa".into());
+            }
+        }
+    }
+    assert_eq!(
+        closed_at,
+        Some(Duration::from_secs(1)),
+        "closed at the operator's failover deadline"
+    );
+    assert_eq!(summed_progress(&sim).closes, 1);
+    assert_eq!(summed_progress(&sim).keyspace_refusals, 0);
+    let _ = ksb;
+    Ok(())
+}

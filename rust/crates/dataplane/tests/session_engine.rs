@@ -10558,3 +10558,131 @@ async fn metered_tenant_session_moves_from_shared_to_single_backend() {
     )
     .await;
 }
+
+fn source_bytes(registry: &MeteringSourceRegistry) -> Vec<u64> {
+    let Ok(bytes) = registry.active_source_bytes() else {
+        unreachable!("metering source registry is available")
+    };
+    bytes
+}
+
+const CHANGE_USER_ATTRIBUTES: [Attribute<'static>; 1] = [Attribute {
+    key: b"program_name",
+    value: b"tenant-change-user",
+}];
+
+/// Spawns a tenant stack over one backend serving `serves`, with the
+/// tenant-migration gate as given, and logs in as `ksa.app`.
+async fn single_backend_tenant_session(
+    serves: KeyspaceScope,
+    gate: bool,
+    registry: Option<MeteringSourceRegistry>,
+) -> (Stack, TenantRoutePlane, ConcurrentFakeBackend, MysqlClient) {
+    let backend = spawn_concurrent_fake_backend(vec![BackendMode::Plain]).await;
+    let (stack, plane) = spawn_tenant_stack(
+        &[(backend.port, serves)],
+        &format!("[balance]\ntenant-migration = {gate}\n"),
+        registry,
+    )
+    .await;
+    let client = tenant_login(&stack, b"ksa.app").await;
+    (stack, plane, backend, client)
+}
+
+#[tokio::test]
+async fn metered_shared_session_refuses_change_user_to_another_tenant() {
+    let Ok(registry) = MeteringSourceRegistry::new(11) else {
+        unreachable!("metering registry")
+    };
+    // Migration disabled: admission alone meters the tenant session.
+    let (stack, plane, backend, mut client) =
+        single_backend_tenant_session(tenants(&["ksa", "ksb"]), false, Some(registry.clone()))
+            .await;
+    let source = tenant_backend_id(backend.port);
+    assert!(client.query_ok("SELECT as_ksa").await);
+    assert_eq!(
+        attributions(&registry),
+        [(source.clone(), "ksa".to_owned())]
+    );
+    let before = source_bytes(&registry);
+
+    assert_eq!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await,
+        Err(1045),
+        "a cross-tenant change-user is refused on a metered shared session"
+    );
+    assert_eq!(
+        source_bytes(&registry),
+        before,
+        "nothing of the refused change-user reached ksa's metered backend"
+    );
+    // The session continues as the verified ksa user, still billed to ksa.
+    assert!(client.query_ok("SELECT still_ksa").await);
+    assert_eq!(
+        attributions(&registry),
+        [(source.clone(), "ksa".to_owned())]
+    );
+    // The same tenant's other user is fine.
+    assert!(
+        client
+            .change_user(b"ksa.reporting", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await
+            .is_ok()
+    );
+    assert!(client.query_ok("SELECT as_ksa_reporting").await);
+    assert_eq!(attributions(&registry), [(source, "ksa".to_owned())]);
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn metered_single_keyspace_session_bills_its_backend_tenant_after_change_user() {
+    let Ok(registry) = MeteringSourceRegistry::new(11) else {
+        unreachable!("metering registry")
+    };
+    // A single-keyspace backend's own tenant decides attribution, so the
+    // change-user is not refused and billing stays with that backend.
+    let (stack, plane, backend, mut client) = single_backend_tenant_session(
+        KeyspaceScope::Single("ksa".to_owned()),
+        true,
+        Some(registry.clone()),
+    )
+    .await;
+    assert!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await
+            .is_ok()
+    );
+    assert!(client.query_ok("SELECT after_change_user").await);
+    assert_eq!(
+        attributions(&registry),
+        [(tenant_backend_id(backend.port), "ksa".to_owned())]
+    );
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}
+
+#[tokio::test]
+async fn unmetered_shared_session_allows_change_user_to_another_tenant() {
+    let (stack, plane, backend, mut client) =
+        single_backend_tenant_session(tenants(&["ksa", "ksb"]), true, None).await;
+    assert!(
+        client
+            .change_user(b"ksb.app", b"", b"secret", &CHANGE_USER_ATTRIBUTES)
+            .await
+            .is_ok(),
+        "without attribution to protect, the router only stops vouching"
+    );
+    assert!(client.query_ok("SELECT as_ksb").await);
+    client.quit().await;
+    stack.dispatch_task.abort();
+    plane.shutdown().await;
+    backend.shutdown().await;
+}

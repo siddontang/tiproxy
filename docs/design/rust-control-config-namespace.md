@@ -304,12 +304,22 @@ labels or the assignment keyspace derived from them.
   reconnect to the same backend keeps the recorded scope.
 - Balancing and failover plan backend pairs whose verified scopes share a
   tenant (shared and single-keyspace backends included); every offer of the
-  pair re-checks its own session as above, so sessions of other tenants on
-  the source are refused.
+  pair re-checks its own session as above. A session that is merely
+  ineligible for the pair (another tenant on an overlapping source, a pinned
+  session) is skipped without starting a failure cooldown or counting a
+  refusal, so the failover timeout still closes it at the operator's
+  deadline.
 - Metering (design K4, brought forward for tenant sessions only): a tenant
   session on a shared backend is attributed to its session keyspace, at
   admission and when it moves onto one, instead of the empty keyspace that
-  detaches metering. Every other assignment keeps its keyspace.
+  detaches metering. Every other assignment keeps its keyspace. While a
+  metered session is attributed by its identity this way, a `COM_CHANGE_USER`
+  to another tenant's user is refused with `1045`/`28000` before it reaches
+  the backend (the session stays the tenant it is billed as); detaching would
+  leave the new tenant unbilled, and re-attributing would bill the old
+  tenant's history to it. On a single-keyspace backend the backend's own
+  tenant stays the billed keyspace, so the change-user is allowed. This holds
+  whether or not `balance.tenant-migration` is on.
 
 Example `/config/ns/tenants` value:
 

@@ -58,6 +58,12 @@ impl Selector {
         self.router.change_user(&self.session, user)
     }
 
+    /// See [`Router::identity_attributed_keyspace`].
+    #[must_use]
+    pub fn identity_attributed_keyspace(&self) -> Option<String> {
+        self.router.identity_attributed_keyspace(&self.session)
+    }
+
     /// Revalidates this session's accepted redirect to `target_id` right
     /// before execution; see [`Router::revalidate_redirect`].
     #[must_use = "a refused redirect must not be executed"]

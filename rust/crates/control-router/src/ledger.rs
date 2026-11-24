@@ -793,6 +793,17 @@ impl Ledger {
         }
     }
 
+    /// The keyspace an active session's assignment (and so metering) is
+    /// attributed to by its user identity rather than by its backend: a
+    /// session with a session keyspace whose recorded scope is a shared
+    /// backend. `None` when the backend's own tenant decides attribution.
+    pub(crate) fn identity_attributed(&self, session: &Session) -> Option<&str> {
+        match self.stage(session) {
+            Ok(Stage::Active(active)) if active.scope.is_shared() => active.keyspace.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Records a successful `COM_CHANGE_USER` to `user` on an active session.
     ///
     /// Fail closed: a user with a different `<keyspace>.` prefix (or none)

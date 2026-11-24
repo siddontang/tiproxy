@@ -491,6 +491,30 @@ impl MeteringSourceRegistry {
             .map_err(|_| MeteringSamplerError::RegistryPoisoned)
     }
 
+    /// Returns the current raw byte count (inbound + outbound) of every source
+    /// generation still owned by the sampler, in the order of
+    /// [`Self::active_source_attributions`]. A diagnostic/testing surface.
+    ///
+    /// # Errors
+    ///
+    /// Returns when registry ownership was poisoned.
+    pub fn active_source_bytes(&self) -> Result<Vec<u64>, MeteringSamplerError> {
+        self.sources
+            .lock()
+            .map(|sources| {
+                sources
+                    .values()
+                    .map(|source| {
+                        let (inbound, outbound) = source
+                            .final_values
+                            .unwrap_or((source.counters.inbound(), source.counters.outbound()));
+                        inbound.saturating_add(outbound)
+                    })
+                    .collect()
+            })
+            .map_err(|_| MeteringSamplerError::RegistryPoisoned)
+    }
+
     /// Registers a successfully attached backend source backed by the exact
     /// raw counters used from dial through handshake/auth/restore.
     ///

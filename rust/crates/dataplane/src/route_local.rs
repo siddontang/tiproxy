@@ -44,6 +44,7 @@ trait LocalRouteAuthority: Send + Sync {
     fn finish(&mut self, assignment_id: &str, connected: bool) -> Option<Settlement>;
     fn change_user(&self, user: &str) -> bool;
     fn revalidate_redirect(&self, target_id: &str) -> bool;
+    fn identity_attributed_keyspace(&self) -> Option<String>;
 }
 
 struct PlaneRouteAuthority {
@@ -92,6 +93,10 @@ impl LocalRouteAuthority for PlaneRouteAuthority {
 
     fn revalidate_redirect(&self, target_id: &str) -> bool {
         self.admission.selector().revalidate_redirect(target_id)
+    }
+
+    fn identity_attributed_keyspace(&self) -> Option<String> {
+        self.admission.selector().identity_attributed_keyspace()
     }
 }
 
@@ -181,6 +186,13 @@ impl LocalRouteChannel {
     #[must_use = "callers may log or count a cleared session keyspace"]
     pub fn change_user(&self, user: &str) -> bool {
         self.authority.change_user(user)
+    }
+
+    /// The keyspace this session's metering is attributed to by its user
+    /// identity (a tenant session on a shared backend), if any.
+    #[must_use]
+    pub fn identity_attributed_keyspace(&self) -> Option<String> {
+        self.authority.identity_attributed_keyspace()
     }
 
     /// Revalidates this session's accepted redirect to `target_id` right
@@ -398,6 +410,10 @@ mod tests {
                 .changed_users
                 .push(user.to_owned());
             true
+        }
+
+        fn identity_attributed_keyspace(&self) -> Option<String> {
+            None
         }
 
         fn revalidate_redirect(&self, target_id: &str) -> bool {

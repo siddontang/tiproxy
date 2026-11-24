@@ -3050,6 +3050,20 @@ impl Engine {
             let _ = self.events.send(SessionEvent::ClientIoError).await;
             return Some(WireErrorSource::Proxy);
         };
+        // A metered tenant session on a shared backend is billed to the
+        // keyspace of its verified user identity. Changing to another
+        // tenant's user there would leave billing either on a tenant the
+        // proxy no longer verifies or, if detached, unbilled. Refuse it
+        // locally, before anything reaches the backend; the session stays
+        // the tenant it is billed as.
+        if self.metering.is_some()
+            && let Some(lease) = &self.local_route_lease
+            && let Some(tenant) = lease.identity_attributed_keyspace()
+            && control_router::user_keyspace(&String::from_utf8_lossy(plan.pending.username()))
+                != Some(tenant.as_str())
+        {
+            return self.refuse_cross_tenant_change_user().await;
+        }
         if let Err(source) = self.begin_change_user(&plan).await {
             return Some(source);
         }
@@ -3073,6 +3087,45 @@ impl Engine {
                 Err(source) => return Some(source),
             }
         }
+    }
+
+    /// Answers a refused cross-tenant `COM_CHANGE_USER` exactly like a
+    /// backend rejection (`ER_ACCESS_DENIED_ERROR`): the client gets the ERR,
+    /// the pending identity is discarded, and the command completes on the
+    /// unchanged session. Nothing is written to the backend.
+    async fn refuse_cross_tenant_change_user(&mut self) -> Option<WireErrorSource> {
+        let mut relay = ChangeUserRelay::new();
+        let Ok(step) = relay.on_event(ChangeUserEvent::BackendError { code: 1045 }) else {
+            self.quit_source = QuitSource::ProxyError;
+            let _ = self.events.send(SessionEvent::BackendIoError).await;
+            return Some(WireErrorSource::Proxy);
+        };
+        self.align_change_user_client_write();
+        if let Err(source) = self
+            .write_client_error(
+                1045,
+                *b"28000",
+                "Access denied: a metered session cannot change to another tenant's user",
+            )
+            .await
+        {
+            let _ = self.events.send(SessionEvent::ClientIoError).await;
+            return Some(source);
+        }
+        let Some(event) = step.session_event else {
+            return Some(WireErrorSource::Proxy);
+        };
+        if self.events.send(event).await.is_err() {
+            return Some(WireErrorSource::Proxy);
+        }
+        let _round_permit = match self
+            .await_effect(SessionEffect::ForwardResponseToClient)
+            .await
+        {
+            EffectAck::Got(permit) => Some(permit),
+            EffectAck::Closing => None,
+        };
+        None
     }
 
     async fn begin_change_user(&mut self, plan: &ChangeUserPlan) -> Result<(), WireErrorSource> {

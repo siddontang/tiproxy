@@ -1104,6 +1104,16 @@ impl Router {
         };
         let target = match target {
             Ok(target) => target,
+            // Tenant-aware: this session is merely ineligible for this pair
+            // (another tenant on an overlapping source, a pinned session).
+            // Skip it without renewing its failure cooldown or recording a
+            // refusal: no command was attempted, and renewing the cooldown
+            // on every pass would keep the failover-timeout close (which
+            // honors that cooldown) from ever reaching the session.
+            Err(RouteError::CrossKeyspace) if keyspace_routing => {
+                self.sources.validate(&prepared.candidate)?;
+                return Ok(None);
+            }
             Err(RouteError::CrossKeyspace) => {
                 self.sources.validate(&prepared.candidate)?;
                 state.ledger.reject_keyspace(&prepared.session, now)?;
@@ -1300,6 +1310,24 @@ impl Router {
         };
         state.ledger.authorize_redirect(session, scope);
         true
+    }
+
+    /// The keyspace `session`'s metering is attributed to by its user
+    /// identity, if any: a tenant session (`keyspace-routing`, prefixed
+    /// login) on a shared backend, whose assignment keyspace comes from the
+    /// session rather than from the backend. The session engine refuses a
+    /// `COM_CHANGE_USER` to another tenant's user while it meters such a
+    /// session, so billing never continues under an identity the proxy no
+    /// longer verifies.
+    #[must_use]
+    pub fn identity_attributed_keyspace(&self, session: &Session) -> Option<String> {
+        if !self.sources.keyspace_routing() {
+            return None;
+        }
+        self.lock()
+            .ledger
+            .identity_attributed(session)
+            .map(str::to_owned)
     }
 
     /// Records a successful `COM_CHANGE_USER` to `user` on `session`. A user
